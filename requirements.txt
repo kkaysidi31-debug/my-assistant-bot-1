@@ -1,4 +1,4 @@
 python-telegram-bot[webhooks,job-queue]>=21,<22
 apscheduler>=3.10,<4
-Flask>=3,<4
+flask>=3,<4
 pytz
