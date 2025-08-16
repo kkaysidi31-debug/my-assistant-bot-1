@@ -42,13 +42,13 @@ async def main():
     # ВАЖНО: в PTB 21.x используем url= (НЕ webhook_url=)
     await app.bot.set_webhook(url=webhook_url, allowed_updates=[])
 
-    # встроенный aiohttp-сервер PTB
-    await app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=url_path,
-        webhook_url=webhook_url,
-    )
+await app.run_webhook(
+    listen="0.0.0.0",
+    port=PORT,
+    url_path=url_path,
+    webhook_url=webhook_url,
+    close_loop=False,          # <-- добавь это
+)
 
 if __name__ == "__main__":
     try:
