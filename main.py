@@ -1,135 +1,153 @@
-import logging
-import os
-import re
-from datetime import datetime, timedelta
-from pytz import timezone
-from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes
-)
-from apscheduler.schedulers.background import BackgroundScheduler
+group("m"))
+        target = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return {"once_at": target, "text": m.group("text").strip()}
 
-# Логирование
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+    # 3) завтра в HH:MM …
+    m = re.match(rf"завтра\s+в\s+{RE_TIME}\s+(?P<text>.+)$", t)
+    if m:
+        hh, mm = int(m.group("h")), int(m.group("m"))
+        base = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
+        target = base + timedelta(days=1)
+        return {"once_at": target, "text": m.group("text").strip()}
 
-# Часовой пояс
-TIMEZONE = timezone("Europe/Kaliningrad")
+    # 4) каждый день в HH:MM …
+    m = re.match(rf"(каждый|ежедн(евно)?)\s*день\s+в\s+{RE_TIME}\s+(?P<text>.+)$", t)
+    if m:
+        hh, mm = int(m.group("h")), int(m.group("m"))
+        return {"daily_at": time(hh, mm, tzinfo=TIMEZONE), "text": m.group("text").strip()}
 
-# ================= Ключи доступа =================
-ACCESS_KEYS = [f"VIP{str(i).zfill(3)}" for i in range(1, 101)]
-USED_KEYS = set()
-ALLOWED_USERS = set()
+    # 5) «30 августа …» (опционально «в HH:MM …»)
+    #    если время не указано — по умолчанию 09:00
+    m = re.match(
+        rf"(?P<day>\d{{1,2}})\s+(?P<month>[а-я]+)(?:\s+в\s+{RE_TIME})?\s+(?P<text>.+)$", t
+    )
+    if m and m.group("month") in MONTHS:
+        day = int(m.group("day"))
+        month = MONTHS[m.group("month")]
+        hh = int(m.group("h")) if m.group("h") else 9
+        mm = int(m.group("m")) if m.group("m") else 0
+        year = now_local().year
+        target = datetime(year, month, day, hh, mm, tzinfo=TIMEZONE)
+        # если дата уже прошла в этом году — перенесём на следующий
+        if target < now_local():
+            try:
+                target = target.replace(year=year + 1)
+            except ValueError:
+                pass
+        return {"once_at": target, "text": m.group("text").strip()}
 
-# Планировщик
-scheduler = BackgroundScheduler(timezone=TIMEZONE)
-scheduler.start()
+    return None
 
-# ================= Напоминания =================
-async def remind(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    await context.bot.send_message(job.chat_id, text=f"🔔 Напоминание: {job.data}")
+# --------- ДОСТУП ПО КЛЮЧУ ---------
+async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    uid = update.effective_user.id
+    if uid in ALLOWED_USERS:
+        return True
 
-# ================= Авторизация =================
+    text = (update.message.text or "").strip()
+    if re.fullmatch(r"VIP\d{3}", text, flags=re.IGNORECASE):
+        key = text.upper()
+        if key in ACCESS_KEYS and ACCESS_KEYS[key] is None:
+            # активируем ключ
+            ACCESS_KEYS[key] = uid
+            ALLOWED_USERS.add(uid)
+            save_json(KEYS_FILE, ACCESS_KEYS)
+            save_json(ACCESS_FILE, list(ALLOWED_USERS))
+            await update.message.reply_text("✅ Доступ подтверждён. Можешь писать напоминания.\n\n" + WELCOME)
+            return True
+        else:
+            await update.message.reply_text("❌ Ключ недействителен или уже использован.")
+            return False
+
+    await update.message.reply_text(
+        "🔒 Этот бот приватный. Пришли одноразовый ключ доступа вида: VIP001 … VIP100."
+    )
+    return False
+
+# --------- ХЭНДЛЕРЫ ---------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in ALLOWED_USERS:
-        await update.message.reply_text("✅ Ты уже авторизован! Можешь создавать напоминания.")
+    if await require_access(update, context):
+        await update.message.reply_text(WELCOME)
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
         return
 
-    await update.message.reply_text("🔑 Введи свой ключ доступа:")
-
-async def check_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    if user_id in ALLOWED_USERS:
-        await set_reminder(update, context)
+    cmd = parse_command(update.message.text or "")
+    if not cmd:
+        await update.message.reply_text(
+            "❓ Не понял формат. Используй, например:\n"
+            "• через 5 минут …\n"
+            "• сегодня в HH:MM …\n"
+            "• завтра в HH:MM …\n"
+            "• каждый день в HH:MM …\n"
+            "• 30 августа …"
+        )
         return
 
-    if text in ACCESS_KEYS and text not in USED_KEYS:
-        ALLOWED_USERS.add(user_id)
-        USED_KEYS.add(text)
-        await update.message.reply_text("✅ Ключ принят! Теперь ты можешь создавать напоминания.")
-    else:
-        await update.message.reply_text("❌ Неверный или уже использованный ключ.")
+    chat_id = update.effective_chat.id
+    app = context.application
 
-# ================= Обработка напоминаний =================
-async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ALLOWED_USERS:
-        await update.message.reply_text("🚫 У тебя нет доступа. Сначала введи ключ.")
+    if "after" in cmd:
+        when = now_local() + cmd["after"]
+        schedule_once(app, when, chat_id, cmd["text"])
+        await update.message.reply_text(
+            f"✅ Ок, напомню {when.strftime('%Y-%m-%d %H:%M')} — «{cmd['text']}». (TZ: {TIMEZONE.zone})"
+        )
         return
 
-    text = update.message.text.lower()
-    now = datetime.now(TIMEZONE)
-
-    # через N минут
-    m = re.match(r"через (\d+) минут", text)
-    if m:
-        minutes = int(m.group(1))
-        run_time = now + timedelta(minutes=minutes)
-        scheduler.add_job(remind, "date", run_date=run_time, args=[context], kwargs={"data": text}, id=str(run_time))
-        await update.message.reply_text(f"⏰ Напоминание через {minutes} минут.")
+    if "once_at" in cmd:
+        when = cmd["once_at"]
+        if when < now_local():
+            await update.message.reply_text("⛔ Это время уже прошло. Укажи время в будущем.")
+            return
+        schedule_once(app, when, chat_id, cmd["text"])
+        await update.message.reply_text(
+            f"✅ Ок, напомню {when.strftime('%Y-%m-%d %H:%M')} — «{cmd['text']}».(TZ: {TIMEZONE.zone})"
+        )
         return
 
-    # сегодня в HH:MM
-    m = re.match(r"сегодня в (\d{1,2}):(\d{2})", text)
-    if m:
-        hour, minute = map(int, m.groups())
-        run_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        scheduler.add_job(remind, "date", run_date=run_time, args=[context], kwargs={"data": text}, id=str(run_time))
-        await update.message.reply_text(f"📅 Напоминание сегодня в {hour:02d}:{minute:02d}.")
+    if "daily_at" in cmd:
+        schedule_daily(app, cmd["daily_at"], chat_id, cmd["text"])
+        hhmm = f"{cmd['daily_at'].hour:02d}:{cmd['daily_at'].minute:02d}"
+        await update.message.reply_text(
+            f"✅ Ок, буду напоминать каждый день в {hhmm} — «{cmd['text']}». (TZ: {TIMEZONE.zone})"
+        )
         return
 
-    # завтра в HH:MM
-    m = re.match(r"завтра в (\d{1,2}):(\d{2})", text)
-    if m:
-        hour, minute = map(int, m.groups())
-        run_time = (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
-        scheduler.add_job(remind, "date", run_date=run_time, args=[context], kwargs={"data": text}, id=str(run_time))
-        await update.message.reply_text(f"📅 Напоминание завтра в {hour:02d}:{minute:02d}.")
-        return
-
-    # каждый день в HH:MM
-    m = re.match(r"каждый день в (\d{1,2}):(\d{2})", text)
-    if m:
-        hour, minute = map(int, m.groups())
-        scheduler.add_job(remind, "cron", hour=hour, minute=minute, args=[context], kwargs={"data": text}, id=f"daily-{hour}-{minute}-{user_id}")
-        await update.message.reply_text(f"🔁 Напоминание каждый день в {hour:02d}:{minute:02d}.")
-        return
-
-    # конкретная дата (30 августа)
-    m = re.match(r"(\d{1,2}) (\w+)", text)
-    months = {
-        "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
-        "мая": 5, "июня": 6, "июля": 7, "августа": 8,"сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
-    }
-    if m and m.group(2) in months:
-        day, month = int(m.group(1)), months[m.group(2)]
-        run_time = datetime(now.year, month, day, 9, 0, tzinfo=TIMEZONE)
-        scheduler.add_job(remind, "date", run_date=run_time, args=[context], kwargs={"data": text}, id=str(run_time))
-        await update.message.reply_text(f"📅 Напоминание {day} {m.group(2)} в 09:00.")
-        return
-
-    await update.message.reply_text("❓ Не понял формат. Примеры:\n"
-                                    "• через 5 минут\n"
-                                    "• сегодня в 09:00\n"
-                                    "• завтра в 10:30\n"
-                                    "• каждый день в 08:00\n"
-                                    "• 30 августа")
-
-# ================= Запуск =================
-def main():
-    BOT_TOKEN = os.getenv("BOT_TOKEN")
+# --------- ЗАПУСК (WEBHOOK) ---------
+async def main():
     if not BOT_TOKEN:
-        raise SystemExit("❌ Нет BOT_TOKEN в переменных окружения!")
+        raise SystemExit("Нет переменной окружения BOT_TOKEN")
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_key))
-    app.run_polling()
+    public_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    if not public_url:
+        # На самом первом деплое URL может быть пуст — сделай повторный деплой
+        log.warning("RENDER_EXTERNAL_URL пуст. Перезапусти деплой после первого старта.")
+        raise SystemExit(1)
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # путь вебхука = токен (удобно и уникально)
+    url_path = BOT_TOKEN
+    webhook_url = f"{public_url.rstrip('/')}/{url_path}"
+    log.info("Ставлю вебхук: %s", webhook_url)
+
+    # В PTB v21 указываем url=, НЕ webhook_url=
+    await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+
+    # Встроенный aiohttp-сервер PTB
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=url_path,
+        # чтобы PTB не пытался закрывать активный event loop при рестартах
+        close_loop=False,
+    )
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
