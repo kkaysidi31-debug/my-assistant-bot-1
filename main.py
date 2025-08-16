@@ -22,7 +22,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", start))
     return app
 
-if name == "__main__":
+if __name__ == "__main__":
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан в переменных окружения")
 
