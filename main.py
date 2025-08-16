@@ -113,7 +113,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Ок, буду напоминать каждый день в {hhmm} — «{cmd['text']}». (TZ: {TIMEZONE.zone})"
         )
-        return
+    return
 
 # --------- ЗАПУСК (WEBHOOK) ---------
 async def main():
