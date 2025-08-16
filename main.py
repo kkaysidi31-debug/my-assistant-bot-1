@@ -222,7 +222,6 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     log.info("Starting bot with polling...")
-    application.run_polling(close_loop=False)
-
+    
 if __name__ == "__main__":
     main()
