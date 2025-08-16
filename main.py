@@ -98,13 +98,15 @@ def parse_message(msg: str):
         return {"once_at": target, "text": text}
 
     # завтра в HH:MM <текст>
-    m = re.match(rf"завтра\s+в\s+{RE_TIME}\s+(?P<text>.+)$", s)
-    if m:
-        hh = int(m.group("h")); mm = int(m.group("m")); text = m.group("text").strip()
-        base = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
-        target = base + timedelta(days=1)
-        return {"once_at": target, "text": text}   # ← вот так, 8 пробелов
-        
+m = re.match(rf"завтра\s+в\s+{RE_TIME}\s+(?P<text>.+)$", s)
+if m:
+    hh = int(m.group("h"))
+    mm = int(m.group("m"))
+    text = m.group("text").strip()
+    base = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
+    target = base + timedelta(days=1)
+    return {"once_at": target, "text": text}
+    
     # в HH:MM <текст> (если прошло — на завтра)
     m = re.match(rf"в\s+{RE_TIME}\s+(?P<text>.+)$", s)
     if m:
