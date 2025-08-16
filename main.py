@@ -1,227 +1,137 @@
-# -*- coding: utf-8 -*-
 import logging
 import re
-from datetime import datetime, timedelta, time as dtime
-
-import pytz
-from flask import Flask
-import threading
-
+import random
+from datetime import datetime, timedelta
+from pytz import timezone
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    CallbackContext,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# ------------------------ ЛОГИ ------------------------
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("reminder-bot")
+# Логирование
+logging.basicConfig(level=logging.INFO)
 
-# ------------------------ ЧАСОВОЙ ПОЯС ------------------------
-TZ = pytz.timezone("Europe/Kaliningrad")
+# Часовой пояс
+TIMEZONE = timezone("Europe/Kaliningrad")
 
-# ------------------------ HEALTH-CHECK (Flask) ------------------------
-flask_app = Flask(__name__)
+# =================== Ключи доступа ===================
+def generate_keys(n=100):
+    keys = {}
+    for _ in range(n):
+        key = f"VIP{random.randint(100, 999)}"
+        keys[key] = None
+    return keys
 
-@flask_app.route("/")
-def home():
-    return "✅ Bot is running!", 200
+ACCESS_KEYS = generate_keys(100)   # 100 ключей
+ALLOWED_USERS = set()
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=8080)
+# =================== Планировщик ===================
+scheduler = BackgroundScheduler(timezone=TIMEZONE)
+scheduler.start()
 
-# ------------------------ ВСПОМОГАТЕЛЬНОЕ ------------------------
-RE_TIME = r"(?P<h>\d{1,2}):(?P<m>\d{2})"
-
-# месяцы по-русски (любая падежная форма примется по префиксу)
-MONTHS = {
-    "янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5,
-    "июн": 6, "июл": 7, "авг": 8, "сен": 9, "сент": 9,
-    "окт": 10, "ноя": 11, "дек": 12,
-}
-def month_from_ru(name: str) -> int | None:
-    s = name.strip().lower()
-    # нормализуем общие окончания (августа -> авг, сентября -> сент)
-    s = s.replace("ё", "е")
-    candidates = [k for k in MONTHS if s.startswith(k)]
-    return MONTHS[candidates[0]] if candidates else None
-
-# ------------------------ ПАРСЕР ФРАЗ ------------------------
-def parse_reminder(text: str):
-    """
-    Возвращает dict:
-      {"once_at": datetime, "text": "..."}  — одноразовое
-      {"daily": (hh, mm),  "text": "..."}  — ежедневное
-      или None, если не распознал.
-    """
-    t = text.strip()
-    now_local = datetime.now(TZ)
-
-    # через N минут/часов
-    m = re.match(r"напомни\s+через\s+(\d+)\s*(минут[уы]?|час[аов]?)\s+(.+)$", t, re.I)
-    if m:
-        n = int(m.group(1))
-        unit = m.group(2).lower()
-        what = m.group(3).strip()
-        delta = timedelta(minutes=n) if unit.startswith("мин") else timedelta(hours=n)
-        return {"once_at": now_local + delta, "text": what}
-
-    # сегодня в HH:MM
-    m = re.match(rf"напомни\s+сегодня\s+в\s+{RE_TIME}\s+(.+)$", t, re.I)
-    if m:
-        hh, mm = int(m.group("h")), int(m.group("m"))
-        what = m.group(4).strip()
-        target = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if target < now_local:
-            target += timedelta(days=1)
-        return {"once_at": target, "text": what}
-
-    # завтра в HH:MM
-    m = re.match(rf"напомни\s+завтра\s+в\s+{RE_TIME}\s+(.+)$", t, re.I)
-    if m:
-        hh, mm = int(m.group("h")), int(m.group("m"))
-        what = m.group(4).strip()
-        base = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        target = base + timedelta(days=1)
-        return {"once_at": target, "text": what}
-
-    # в HH:MM (на сегодня/завтра)
-    m = re.match(rf"напомни\s+в\s+{RE_TIME}\s+(.+)$", t, re.I)
-    if m:
-        hh, mm = int(m.group("h")), int(m.group("m"))
-        what = m.group(4).strip()
-        target = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if target < now_local:
-            target += timedelta(days=1)
-        return {"once_at": target, "text": what}
-
-    # каждый день в HH:MM
-    m = re.match(rf"напомни\s+каждый\s+день\s+в\s+{RE_TIME}\s+(.+)$", t, re.I)
-    if m:
-        hh, mm = int(m.group("h")), int(m.group("m"))
-        what = m.group(4).strip()
-        return {"daily": (hh, mm), "text": what}
-
-    # ---- НОВОЕ: «напомни 30 августа [2025] [в 16:00] <текст>» ----
-    # год и время — опционально. Если времени нет — ставим 09:00.
-    m = re.match(
-        rf"напомни\s+(?P<d>\d{{1,2}})\s+(?P<mon>[А-Яа-яЁё]+)\s*(?P<y>\d{{4}})?(?:\s+в\s+{RE_TIME})?\s+(?P<text>.+)$",
-        t, re.I
-    )
-    if m:
-        day = int(m.group("d"))
-        mon = month_from_ru(m.group("mon") or "")
-        if not mon:
-            return None
-        year = int(m.group("y")) if m.group("y") else now_local.year
-        # время
-        if m.group("h") and m.group("m"):
-            hh, mm = int(m.group("h")), int(m.group("m"))
-        else:
-            hh, mm = 9, 0  # время по умолчанию 09:00
-        what = (m.group("text") or "").strip()
-        try:
-            target = TZ.localize(datetime(year, mon, day, hh, mm, 0, 0))
-            # если дата/время уже прошло в текущем году без явного года — переносим на следующий
-            if not m.group("y") and target < now_local:
-                target = TZ.localize(datetime(year + 1, mon, day, hh, mm, 0, 0))
-            return {"once_at": target, "text": what}
-        except ValueError:
-            return None
-
-    return None
-
-# ------------------------ CALLBACK-и ДЛЯ JOBQUEUE ------------------------
-async def job_once(ctx: CallbackContext) -> None:
-    data = ctx.job.data or {}
-    text = data.get("text", "Напоминание")
-    await ctx.bot.send_message(ctx.job.chat_id, f"🔔 {text}")
-
-async def job_daily(ctx: CallbackContext) -> None:
-    data = ctx.job.data or {}
-    text = data.get("text", "Ежедневное напоминание")
-    await ctx.bot.send_message(ctx.job.chat_id, f"🔔 {text}")
-
-# ------------------------ ОБРАБОТЧИКИ ------------------------
+# =================== Функции ===================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "Бот запущен ✅\n\n"
-        "Примеры:\n"
-        "• напомни сегодня в 16:00 купить молоко\n"
-        "• напомни завтра в 9:15 встреча с Андреем\n"
-        "• напомни 30 августа в 10:00 заплатить за кредит\n"
-        "• напомни 30 августа заплатить за кредит   (в 09:00 по умолчанию)\n"
-        "• напомни через 5 минут попить воды\n"
-        "• напомни каждый день в 09:30 зарядка\n"
-        f"(часовой пояс: {TZ.zone})"
-    )
-    await update.message.reply_text(msg)
+    args = context.args
+    user_id = update.effective_user.id
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+    if user_id in ALLOWED_USERS:
+        await update.message.reply_text("✅ У вас уже есть доступ!")
         return
 
-    parsed = parse_reminder(update.message.text)
-    if not parsed:
-        await update.message.reply_text(
-            "⚠️ Не понял формат. Примеры: "
-            "«напомни 30 августа в 16:00 оплатить ЖКХ», "
-            "«напомни через 10 минут сделать перерыв», "
-            "«напомни каждый день в 09:30 зарядка»."
-        )
+    if args and args[0] in ACCESS_KEYS:
+        if ACCESS_KEYS[args[0]] is None:
+            ACCESS_KEYS[args[0]] = user_id
+            ALLOWED_USERS.add(user_id)
+            await update.message.reply_text("🔑 Доступ предоставлен!")
+        else:
+            await update.message.reply_text("⛔ Этот ключ уже использован.")
+    else:
+        await update.message.reply_text("⛔ У вас нет доступа.")
+
+async def remind(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    await context.bot.send_message(job.chat_id, text=f"⏰ Напоминание: {job.data}")
+
+async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ У вас нет доступа. Введите ключ при /start.")
         return
 
-    chat_id = update.message.chat_id
+    text = update.message.text.lower()
 
-    if "once_at" in parsed:
-        target = parsed["once_at"]
-        context.job_queue.run_once(
-            job_once,
-            when=target.astimezone(TZ),
-            chat_id=chat_id,
-            name=f"once-{chat_id}-{int(target.timestamp())}",
-            data={"text": parsed["text"]},
-            tzinfo=TZ,
-        )
-        await update.message.reply_text(
-            f"✅ Ок, напомню {target.strftime('%Y-%m-%d %H:%M')} — «{parsed['text']}». (TZ: {TZ.zone})"
-        )
+    # --- через X минут ---
+    match = re.match(r"через (\d+) минут (.+)", text)
+    if match:
+        minutes, task = int(match.group(1)), match.group(2)
+        run_time = datetime.now(TIMEZONE) + timedelta(minutes=minutes)
+        scheduler.add_job(remind, "date", run_date=run_time, args=[context],
+                          id=str(run_time)+task, kwargs={"data": task}, replace_existing=True)
+        await update.message.reply_text(f"✅ Напоминание через {minutes} минут: {task}")
         return
 
-    if "daily" in parsed:
-        hh, mm = parsed["daily"]
-        context.job_queue.run_daily(
-            job_daily,
-            time=dtime(hour=hh, minute=mm, tzinfo=TZ),
-            chat_id=chat_id,
-            name=f"daily-{chat_id}-{hh:02}{mm:02}",
-            data={"text": parsed["text"]},
-        )
-        await update.message.reply_text(
-            f"✅ Ок, буду напоминать каждый день в {hh:02}:{mm:02} — «{parsed['text']}». (TZ: {TZ.zone})"
-        )
+    # --- сегодня в HH:MM ---
+    match = re.match(r"сегодня в (\d{1,2}):(\d{2}) (.+)", text)
+    if match:
+        hour, minute, task = int(match.group(1)), int(match.group(2)), match.group(3)
+        run_time = datetime.now(TIMEZONE).replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if run_time < datetime.now(TIMEZONE):
+            await update.message.reply_text("⛔ Это время уже прошло сегодня.")
+            return
+        scheduler.add_job(remind, "date", run_date=run_time, args=[context],
+                          id=str(run_time)+task, kwargs={"data": task}, replace_existing=True)
+        await update.message.reply_text(f"✅ Напоминание сегодня в {hour:02d}:{minute:02d}: {task}")
+        return
 
-# ------------------------ ЗАПУСК ------------------------
+    # --- завтра в HH:MM ---
+    match = re.match(r"завтра в (\d{1,2}):(\d{2}) (.+)", text)
+    if match:
+        hour, minute, task = int(match.group(1)), int(match.group(2)), match.group(3)
+        run_time = datetime.now(TIMEZONE).replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=1)
+        scheduler.add_job(remind, "date", run_date=run_time, args=[context],
+                          id=str(run_time)+task, kwargs={"data": task}, replace_existing=True)
+        await update.message.reply_text(f"✅ Напоминание завтра в {hour:02d}:{minute:02d}: {task}")
+        return
+
+    # --- каждый день в HH:MM ---
+    match = re.match(r"каждый день в (\d{1,2}):(\d{2}) (.+)", text)
+    if match:
+        hour, minute, task = int(match.group(1)), int(match.group(2)), match.group(3)
+        scheduler.add_job(remind, "cron", hour=hour, minute=minute, args=[context],id=task, kwargs={"data": task}, replace_existing=True)
+        await update.message.reply_text(f"✅ Ежедневное напоминание в {hour:02d}:{minute:02d}: {task}")
+        return
+
+    # --- конкретная дата (ДД месяц) ---
+    match = re.match(r"(\d{1,2}) (\w+) (.+)", text)
+    if match:
+        day, month_name, task = match.group(1), match.group(2), match.group(3)
+        months = {
+            "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+            "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
+        }
+        if month_name in months:
+            month = months[month_name]
+            year = datetime.now(TIMEZONE).year
+            run_time = datetime(year, month, int(day), 9, 0, tzinfo=TIMEZONE)  # по умолчанию 09:00
+            scheduler.add_job(remind, "date", run_date=run_time, args=[context],
+                              id=str(run_time)+task, kwargs={"data": task}, replace_existing=True)
+            await update.message.reply_text(f"✅ Напоминание {day} {month_name}: {task}")
+            return
+
+    await update.message.reply_text("❓ Не понял формат. Используй:\n"
+                                    "- через 5 минут ...\n"
+                                    "- сегодня в HH:MM ...\n"
+                                    "- завтра в HH:MM ...\n"
+                                    "- каждый день в HH:MM ...\n"
+                                    "- 30 августа ...")
+
+# =================== Запуск ===================
 def main():
-    import os
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise SystemExit("Нет переменной окружения BOT_TOKEN")
+    app = Application.builder().token("ТОКЕН_ТВОЕГО_БОТА").build()
 
-    threading.Thread(target=run_flask, daemon=True).start()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, set_reminder))
 
-    application = Application.builder().token(token).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.run_polling()
 
-    log.info("Starting bot with polling...")
-    
 if __name__ == "__main__":
     main()
