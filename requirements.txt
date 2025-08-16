@@ -1,1 +1,3 @@
 python-telegram-bot[webhooks,job-queue]>=21,<22
+flask
+pytz
