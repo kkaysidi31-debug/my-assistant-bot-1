@@ -1,153 +1,258 @@
-group("m"))
-        target = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
-        return {"once_at": target, "text": m.group("text").strip()}
+# -*- coding: utf-8 -*-
+import os
+import logging
+import re
+from datetime import datetime, timedelta
+from pytz import timezone
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
+from apscheduler.schedulers.background import BackgroundScheduler
 
-    # 3) завтра в HH:MM …
-    m = re.match(rf"завтра\s+в\s+{RE_TIME}\s+(?P<text>.+)$", t)
+# -------------------- базовая настройка --------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("reminder-bot")
+
+TIMEZONE = timezone("Europe/Kaliningrad")
+
+def now_local() -> datetime:
+    return datetime.now(TIMEZONE)
+
+# -------------------- ключи доступа ------------------------
+# Генерим VIP001..VIP100
+ACCESS_KEYS = {f"VIP{n:03d}": None for n in range(1, 101)}  # значение = user_id, который активировал
+ALLOWED_USERS: set[int] = set()
+
+async def cmd_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Активация ключа: /key VIP0xx"""
+    if not context.args:
+        await update.message.reply_text("Пришли ключ так: /key VIP001")
+        return
+
+    user_id = update.effective_user.id
+    key = context.args[0].strip().upper()
+
+    if user_id in ALLOWED_USERS:
+        await update.message.reply_text("✅ У тебя уже есть доступ.")
+        return
+
+    if key not in ACCESS_KEYS:
+        await update.message.reply_text("❌ Неверный ключ.")
+        return
+
+    if ACCESS_KEYS[key] is not None and ACCESS_KEYS[key] != user_id:
+        await update.message.reply_text("❌ Этот ключ уже активирован другим пользователем.")
+        return
+
+    # активируем
+    ACCESS_KEYS[key] = user_id
+    ALLOWED_USERS.add(user_id)
+    await update.message.reply_text("✅ Доступ выдан! Напиши /start")
+
+def check_access(update: Update) -> bool:
+    return update.effective_user and update.effective_user.id in ALLOWED_USERS
+
+# -------------------- парсер фраз --------------------------
+RE_TIME = r'(?P<h>\d{1,2}):(?P<m>\d{2})'
+
+MONTHS = {
+    # родительный + именительный
+    "января": 1, "январь": 1,
+    "февраля": 2, "февраль": 2,
+    "марта": 3, "март": 3,
+    "апреля": 4, "апрель": 4,
+    "мая": 5, "май": 5,
+    "июня": 6, "июнь": 6,
+    "июля": 7, "июль": 7,
+    "августа": 8, "август": 8,
+    "сентября": 9, "сентябрь": 9,
+    "октября": 10, "октябрь": 10,
+    "ноября": 11, "ноябрь": 11,
+    "декабря": 12, "декабрь": 12,
+}
+
+def parse_command(text: str):
+    """
+    Возвращает одну из форм:
+    - {"after": timedelta, "text": str}
+    - {"once_at": datetime, "text": str}
+    - {"daily_at": (hour, minute), "text": str}
+    - {"date": (year, month, day, hour, minute), "text": str}
+    """
+    t = text.strip().lower()
+
+    # 1) "через 5 минут <текст>" или "через 2 часа <текст>"
+    m = re.match(r'^через\s+(?P<n>\d+)\s*(мин(ут[уы])?|м|час(а|ов)?|ч)\s+(?P<text>.+)$', t)
     if m:
-        hh, mm = int(m.group("h")), int(m.group("m"))
+        n = int(m.group('n'))
+        word = m.group(2)  # мин..., м, час..., ч
+        if word.startswith('мин') or word == 'м':
+            delta = timedelta(minutes=n)
+        else:
+            delta = timedelta(hours=n)
+        return {"after": delta, "text": m.group('text').strip()}
+
+    # 2) "сегодня в HH:MM <текст>"
+    m = re.match(rf'^сегодня\s+в\s+{RE_TIME}\s+(?P<text>.+)$', t)
+    if m:
+        hh, mm = int(m.group('h')), int(m.group('m'))
+        target = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return {"once_at": target, "text": m.group('text').strip()}
+
+    # 3) "завтра в HH:MM <текст>"
+    m = re.match(rf'^завтра\s+в\s+{RE_TIME}\s+(?P<text>.+)$', t)
+    if m:
+        hh, mm = int(m.group('h')), int(m.group('m'))
         base = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
         target = base + timedelta(days=1)
-        return {"once_at": target, "text": m.group("text").strip()}
+        return {"once_at": target, "text": m.group('text').strip()}
 
-    # 4) каждый день в HH:MM …
-    m = re.match(rf"(каждый|ежедн(евно)?)\s*день\s+в\s+{RE_TIME}\s+(?P<text>.+)$", t)
+    # 4) "каждый день в HH:MM <текст>"
+    m = re.match(rf'^каждый\s+день\s+в\s+{RE_TIME}\s+(?P<text>.+)$', t)
     if m:
-        hh, mm = int(m.group("h")), int(m.group("m"))
-        return {"daily_at": time(hh, mm, tzinfo=TIMEZONE), "text": m.group("text").strip()}
+        hh, mm = int(m.group('h')), int(m.group('m'))
+        return {"daily_at": (hh, mm), "text": m.group('text').strip()}
 
-    # 5) «30 августа …» (опционально «в HH:MM …»)
-    #    если время не указано — по умолчанию 09:00
-    m = re.match(
-        rf"(?P<day>\d{{1,2}})\s+(?P<month>[а-я]+)(?:\s+в\s+{RE_TIME})?\s+(?P<text>.+)$", t
+    # 5) "30 августа <текст>" или "30 августа в HH:MM <текст>"
+    m = re.match(rf'^(?P<d>\d{{1,2}})\s+(?P<month>[а-яё]+)(?:\s+в\s+{RE_TIME})?\s+(?P<text>.+)$',
+        t
     )
-    if m and m.group("month") in MONTHS:
-        day = int(m.group("day"))
-        month = MONTHS[m.group("month")]
-        hh = int(m.group("h")) if m.group("h") else 9
-        mm = int(m.group("m")) if m.group("m") else 0
+    if m and m.group('month') in MONTHS:
+        day = int(m.group('d'))
+        month = MONTHS[m.group('month')]
+        if m.group('h') and m.group('m'):
+            hh, mm = int(m.group('h')), int(m.group('m'))
+        else:
+            hh, mm = 9, 0  # по умолчанию 09:00
         year = now_local().year
-        target = datetime(year, month, day, hh, mm, tzinfo=TIMEZONE)
-        # если дата уже прошла в этом году — перенесём на следующий
-        if target < now_local():
-            try:
-                target = target.replace(year=year + 1)
-            except ValueError:
-                pass
-        return {"once_at": target, "text": m.group("text").strip()}
+        return {"date": (year, month, day, hh, mm), "text": m.group('text').strip()}
 
     return None
 
-# --------- ДОСТУП ПО КЛЮЧУ ---------
-async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    uid = update.effective_user.id
-    if uid in ALLOWED_USERS:
-        return True
+# -------------------- планировщик --------------------------
+scheduler = BackgroundScheduler(timezone=TIMEZONE)
+scheduler.start()
 
-    text = (update.message.text or "").strip()
-    if re.fullmatch(r"VIP\d{3}", text, flags=re.IGNORECASE):
-        key = text.upper()
-        if key in ACCESS_KEYS and ACCESS_KEYS[key] is None:
-            # активируем ключ
-            ACCESS_KEYS[key] = uid
-            ALLOWED_USERS.add(uid)
-            save_json(KEYS_FILE, ACCESS_KEYS)
-            save_json(ACCESS_FILE, list(ALLOWED_USERS))
-            await update.message.reply_text("✅ Доступ подтверждён. Можешь писать напоминания.\n\n" + WELCOME)
-            return True
-        else:
-            await update.message.reply_text("❌ Ключ недействителен или уже использован.")
-            return False
+async def remind(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.kwargs["data"]
+    chat_id = data["chat_id"]
+    text = data["text"]
+    await context.application.bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {text}")
 
-    await update.message.reply_text(
-        "🔒 Этот бот приватный. Пришли одноразовый ключ доступа вида: VIP001 … VIP100."
-    )
-    return False
+# -------------------- хендлеры -----------------------------
+HELP = (
+    "Бот запущен ✅\n\n"
+    "Примеры:\n"
+    "• напомни через 5 минут попить воды\n"
+    "• напомни сегодня в 16:00 купить молоко\n"
+    "• напомни завтра в 9:15 встреча с Андреем\n"
+    "• напомни каждый день в 09:30 зарядка\n"
+    "• напомни 30 августа в 10:00 заплатить кредит\n"
+    "(часовой пояс: Europe/Kaliningrad)"
+)
 
-# --------- ХЭНДЛЕРЫ ---------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await require_access(update, context):
-        await update.message.reply_text(WELCOME)
+    if not check_access(update):
+        await update.message.reply_text("🔒 Приватный бот. Пришли ключ: /key VIP001")
+        return
+    await update.message.reply_text(HELP)
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await require_access(update, context):
+async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_access(update):
+        await update.message.reply_text("🔒 Нет доступа. Пришли ключ: /key VIP001")
         return
 
-    cmd = parse_command(update.message.text or "")
-    if not cmd:
+    text = update.message.text.strip()
+    # допускаем начальные слова "добавь" / "напомни"
+    if text.lower().startswith("добавь "):
+        text = "напомни " + text[7:].strip()
+
+    if text.lower().startswith("напомни "):
+        text = text[len("напомни "):]
+
+    parsed = parse_command(text)
+    if not parsed:
         await update.message.reply_text(
-            "❓ Не понял формат. Используй, например:\n"
-            "• через 5 минут …\n"
-            "• сегодня в HH:MM …\n"
-            "• завтра в HH:MM …\n"
-            "• каждый день в HH:MM …\n"
-            "• 30 августа …"
+            "❓ Не понял формат. Примеры:\n"
+            "• через 5 минут ...\n"
+            "• сегодня в HH:MM ...\n"
+            "• завтра в HH:MM ...\n"
+            "• каждый день в HH:MM ...\n"
+            "• 30 августа [в HH:MM] ..."
         )
         return
 
     chat_id = update.effective_chat.id
-    app = context.application
 
-    if "after" in cmd:
-        when = now_local() + cmd["after"]
-        schedule_once(app, when, chat_id, cmd["text"])
+    if "after" in parsed:
+        run_time = now_local() + parsed["after"]
+        scheduler.add_job(
+            remind, "date", run_date=run_time,
+            kwargs={"data": {"chat_id": chat_id, "text": parsed["text"]}},
+            id=f"once_{chat_id}_{run_time.timestamp()}_{hash(parsed['text'])}",
+            replace_existing=True,
+        )
         await update.message.reply_text(
-            f"✅ Ок, напомню {when.strftime('%Y-%m-%d %H:%M')} — «{cmd['text']}». (TZ: {TIMEZONE.zone})"
+            f"✅ Ок, напомню {run_time.strftime('%Y-%m-%d %H:%M')} — «{parsed['text']}». (TZ: Europe/Kaliningrad)"
         )
         return
 
-    if "once_at" in cmd:
-        when = cmd["once_at"]
-        if when < now_local():
-            await update.message.reply_text("⛔ Это время уже прошло. Укажи время в будущем.")
-            return
-        schedule_once(app, when, chat_id, cmd["text"])
+    if "once_at" in parsed:
+        run_time = parsed["once_at"]
+        scheduler.add_job(
+            remind, "date", run_date=run_time,
+            kwargs={"data": {"chat_id": chat_id, "text": parsed["text"]}},
+            id=f"once_{chat_id}_{run_time.timestamp()}_{hash(parsed['text'])}",
+            replace_existing=True,
+        )
         await update.message.reply_text(
-            f"✅ Ок, напомню {when.strftime('%Y-%m-%d %H:%M')} — «{cmd['text']}».(TZ: {TIMEZONE.zone})"
+            f"✅ Ок, напомню {run_time.strftime('%Y-%m-%d %H:%M')} — «{parsed['text']}». (TZ: Europe/Kaliningrad)"
         )
         return
 
-    if "daily_at" in cmd:
-        schedule_daily(app, cmd["daily_at"], chat_id, cmd["text"])
-        hhmm = f"{cmd['daily_at'].hour:02d}:{cmd['daily_at'].minute:02d}"
-        await update.message.reply_text(
-            f"✅ Ок, буду напоминать каждый день в {hhmm} — «{cmd['text']}». (TZ: {TIMEZONE.zone})"
+    if "daily_at" in parsed:
+        hh, mm = parsed["daily_at"]
+        scheduler.add_job(
+            remind, "cron", hour=hh, minute=mm,
+            kwargs={"data": {"chat_id": chat_id, "text": parsed["text"]}},
+            id=f"daily_{chat_id}_{hh:02d}{mm:02d}_{hash(parsed['text'])}",
+            replace_existing=True,
         )
-    return
+        await update.message.reply_text(
+            f"✅ Ок, буду напоминать каждый день в {hh:02d}:{mm:02d} — «{parsed['text']}». (TZ: Europe/Kaliningrad)"
+        )
+        return
 
-# --------- ЗАПУСК (WEBHOOK) ---------
-async def main():
+    if "date" in parsed:
+        y, mth, d, hh, mm = parsed["date"]run_time = datetime(y, mth, d, hh, mm, tzinfo=TIMEZONE)
+        scheduler.add_job(
+            remind, "date", run_date=run_time,
+            kwargs={"data": {"chat_id": chat_id, "text": parsed["text"]}},
+            id=f"date_{chat_id}_{y}{mth:02d}{d:02d}{hh:02d}{mm:02d}_{hash(parsed['text'])}",
+            replace_existing=True,
+        )
+        mon_names = {v: k for k, v in MONTHS.items() if k.endswith('а') or k in ("май",)}
+        month_name = mon_names.get(mth, f"{mth}")
+        await update.message.reply_text(
+            f"✅ Напоминание {d} {month_name} в {hh:02d}:{mm:02d} — «{parsed['text']}». (TZ: Europe/Kaliningrad)"
+        )
+        return
+
+# -------------------- запуск -------------------------------
+def main():
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
     if not BOT_TOKEN:
         raise SystemExit("Нет переменной окружения BOT_TOKEN")
 
-    public_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
-    if not public_url:
-        # На самом первом деплое URL может быть пуст — сделай повторный деплой
-        log.warning("RENDER_EXTERNAL_URL пуст. Перезапусти деплой после первого старта.")
-        raise SystemExit(1)
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("key", cmd_key))  # активация ключа
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, set_reminder))
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # путь вебхука = токен (удобно и уникально)
-    url_path = BOT_TOKEN
-    webhook_url = f"{public_url.rstrip('/')}/{url_path}"
-    log.info("Ставлю вебхук: %s", webhook_url)
-
-    # В PTB v21 указываем url=, НЕ webhook_url=
-    await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
-
-    # Встроенный aiohttp-сервер PTB
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=url_path,
-        # чтобы PTB не пытался закрывать активный event loop при рестартах
-        close_loop=False,
-    )
+    log.info("Starting bot with polling...")
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
