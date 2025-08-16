@@ -51,5 +51,7 @@ async def main():
         close_loop=False,  # чтобы не пытался закрыть активный event loop
     )
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if name == "__main__":
+    import asyncio
+    asyncio.get_event_loop().create_task(main())
+    asyncio.get_event_loop().run_forever()
