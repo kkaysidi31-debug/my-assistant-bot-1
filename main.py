@@ -103,8 +103,8 @@ def parse_message(msg: str):
         hh = int(m.group("h")); mm = int(m.group("m")); text = m.group("text").strip()
         base = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
         target = base + timedelta(days=1)
-        return {"once_at": target, "text": text}
-
+        return {"once_at": target, "text": text}   # ← вот так, 8 пробелов
+        
     # в HH:MM <текст> (если прошло — на завтра)
     m = re.match(rf"в\s+{RE_TIME}\s+(?P<text>.+)$", s)
     if m:
