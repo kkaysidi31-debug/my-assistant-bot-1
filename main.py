@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 import os
-import io
 import re
-import threading
 import logging
+import threading
+import tempfile
 from datetime import datetime, timedelta, time
 
 from flask import Flask, Response
@@ -25,10 +25,22 @@ log = logging.getLogger("reminder-bot")
 # ---------------------- НАСТРОЙКИ ----------------------
 TIMEZONE = timezone("Europe/Kaliningrad")
 
-# Приватный доступ: VIP001 … VIP100
+# Приватный доступ: VIP001 … VIP100 (регистр не важен)
 ACCESS_KEYS = {f"vip{n:03d}" for n in range(1, 101)}
 USED_KEYS: set[str] = set()
 ALLOWED_USERS: set[int] = set()
+
+# ---------------------- KEEP-ALIVE ДЛЯ RENDER ----------------------
+flask_app = Flask(__name__)
+
+@flask_app.get("/")
+def health():
+    return Response("ok", mimetype="text/plain")
+
+def run_flask():
+    port = int(os.getenv("PORT", "8080"))
+    log.info("HTTP keep-alive on 0.0.0.0:%s", port)
+    flask_app.run(host="0.0.0.0", port=port, debug=False)
 
 # ---------------------- ПЛАНИРОВЩИК ----------------------
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
@@ -39,27 +51,28 @@ def now_local() -> datetime:
     return datetime.now(TIMEZONE)
 
 RU_MONTHS = {
-    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
-    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
-    "январь": 1, "февраль": 2, "март": 3, "апрель": 4, "июнь": 6,
-    "июль": 7, "август": 8, "сентябрь": 9, "октябрь": 10, "ноябрь": 11, "декабрь": 12,
+    "января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,
+    "июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12,
+    # допускаем именительный на всякий случай
+    "январь":1,"февраль":2,"март":3,"апрель":4,"май":5,"июнь":6,"июль":7,
+    "август":8,"сентябрь":9,"октябрь":10,"ноябрь":11,"декабрь":12
 }
 RE_TIME = r"(?P<h>\d{1,2}):(?P<m>\d{2})"
 
 def _clean_text(s: str) -> str:
-    s = s.strip().lower()
-    s = s.replace("ё", "е")
+    s = s.strip().lower().replace("ё", "е")
+    # убираем «напомни / напомните / напомни-ка …»
     s = re.sub(r"^(напомни(те)?-?ка?\s+)", "", s)
     s = re.sub(r"\s+", " ", s)
     return s
 
 def parse_text(text: str):
     """
-    Возвращает одно из:
-      {"after": timedelta, "text": "..."}
-      {"once_at": datetime, "text": "..."}
-      {"daily_at": time(tzinfo=TIMEZONE), "text": "..."}
-    или None
+    Возвращает:
+      {"after": timedelta, "text": "..."}            — через N минут/часов …
+      {"once_at": datetime, "text": "..."}           — сегодня/завтра/дата
+      {"daily_at": time(tzinfo=TIMEZONE), "text": "..."}  — каждый день в HH:MM
+      или None
     """
     t = _clean_text(text)
 
@@ -116,7 +129,7 @@ def parse_text(text: str):
 
     return None
 
-# ---------------------- ЗАДАЧИ ----------------------
+# ---------------------- ОТПРАВКА СООБЩЕНИЙ ----------------------
 async def _send_text(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data  # {"chat_id":..., "text":...}
     try:
@@ -124,19 +137,10 @@ async def _send_text(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("send_message failed: %s", e)
 
-def schedule_once(run_at: datetime, chat_id: int, text: str):
-    scheduler.add_job(
-        lambda: None, "date", run_date=run_at
-    )  # dummy для ID предсказуемости
-    # через JobQueue (точнее в PTB): сделаем через run_once с delay
-    # но мы уже используем APScheduler для триггера, поэтому просто прокинем в PTB через 1 сек:
-    # Упростим: APScheduler запланирует «будильник», который из PTB мы не можем вызвать напрямую.
-    # Поэтому сделаем следующую хитрость: когда добавляем — сразу считаем delay и ставим PTB job.
-    # (ровно так же делали раньше)
-    pass  # будет выставлено в основном обработчике через context.job_queue.run_once
-
-# ---------------------- ОБРАБОТЧИКИ ----------------------
+# ---------------------- ДОСТУП / КЛЮЧИ ----------------------
+WELCOME_PRIVATE = "Бот приватный. Введи ключ доступа в формате ABC123."
 HELP_TEXT = (
+    "Бот запущен ✅\n\n"
     "Примеры:\n"
     "• напомни сегодня в 16:00 купить молоко\n"
     "• напомни завтра в 9:15 встреча с Андреем\n"
@@ -147,28 +151,12 @@ HELP_TEXT = (
     "(часовой пояс: Europe/Kaliningrad)"
 )
 
-WELCOME_PRIVATE = (
-    "Бот приватный. Введи ключ доступа в формате ABC123."
-)
-
-WELCOME_OK = (
-    "Ключ принят ✅. Теперь можно ставить напоминания.\n\n"
-    "Бот запущен ✅\n\n" + HELP_TEXT
-)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ALLOWED_USERS:
-        await update.message.reply_text(WELCOME_PRIVATE, parse_mode="Markdown")
-        return
-    await update.message.reply_text("Бот запущен ✅\n\n" + HELP_TEXT)
-
 def _looks_like_key(s: str) -> bool:
     s = s.strip().lower()
     return bool(re.fullmatch(r"[a-z]{3}\d{3}", s))
 
-async def try_accept_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Пробуем принять ключ. Вернёт True, если это был ключ (и мы ответили)."""
+async def try_accept_key(update: Update) -> bool:
+    """Пробуем принять ключ. True — если это ключ и мы ответили."""
     if not update.message or not update.message.text:
         return False
     text = update.message.text.strip().lower()
@@ -182,23 +170,28 @@ async def try_accept_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text in ACCESS_KEYS:
         USED_KEYS.add(text)
         ALLOWED_USERS.add(update.effective_user.id)
-        await update.message.reply_text(WELCOME_OK)
+        await update.message.reply_text("Ключ принят ✅. Теперь можно ставить напоминания.\n\n" + HELP_TEXT)
         return True
 
     await update.message.reply_text("Неверный ключ ❌.")
     return True
 
-async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # доступ
+# ---------------------- ХЭНДЛЕРЫ ----------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USERS:
-        # если это ключ — обработаем
-        handled = await try_accept_key(update, context)
+        await update.message.reply_text(WELCOME_PRIVATE, parse_mode="Markdown")
+        return
+    await update.message.reply_text(HELP_TEXT)
+
+async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USERS:
+        handled = await try_accept_key(update)
         if not handled:
             await update.message.reply_text(WELCOME_PRIVATE, parse_mode="Markdown")
         return
 
-    # текст → задача
     text = (update.message.text or "").strip()
     p = parse_text(text)
     if not p:
@@ -216,7 +209,7 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "after" in p:
         when = now_local() + p["after"]
-        delay = (when - now_local()).total_seconds()
+        delay = max(1, int((when - now_local()).total_seconds()))
         context.job_queue.run_once(
             _send_text, when=delay,
             data={"chat_id": chat_id, "text": p["text"]},
@@ -231,8 +224,7 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         when = p["once_at"]
         delay = max(1, int((when - now_local()).total_seconds()))
         context.job_queue.run_once(
-            _send_text, when=delay,
-            data={"chat_id": chat_id, "text": p["text"]},
+            _send_text, when=delay,data={"chat_id": chat_id, "text": p["text"]},
             name=f"once_{chat_id}_{when.timestamp()}"
         )
         await update.message.reply_text(
@@ -243,11 +235,9 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "daily_at" in p:
         hh = p["daily_at"].hour
         mm = p["daily_at"].minute
-        # если время на сегодня прошло — первая сработка завтра
         first = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
         if first <= now_local():
             first += timedelta(days=1)
-        # период 24 часа
         delay = max(1, int((first - now_local()).total_seconds()))
         context.job_queue.run_repeating(
             _send_text, interval=24*60*60, first=delay,
@@ -286,24 +276,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # прогоняем распознанный текст через общий парсер
-        fake_update = Update(
-            update.update_id,
-            message=update.message  # повторно используем сообщение для ответа
-        )
-        # заменим текст в message для downstream-логики
-        fake_update.message.text = text
-        await set_reminder(fake_update, context)
+        update.message.text = text
+        await set_reminder(update, context)
 
     except Exception as e:
         log.exception("voice handling failed: %s", e)
         await update.message.reply_text("Ошибка при распознавании голосового 😕")
 
 async def transcribe_ogg(path: str) -> str | None:
-    """
-    Пытаемся сначала новым SDK, потом старым.
-    """
+    """Распознаём через OpenAI Whisper. Поддержаны openai>=1.x и старый SDK."""
+    # Попытка новым SDK
     try:
-        # Новый SDK (openai>=1.x)
         from openai import OpenAI
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         with open(path, "rb") as f:
@@ -311,44 +294,37 @@ async def transcribe_ogg(path: str) -> str | None:
                 model="whisper-1",
                 file=f,
                 response_format="text",
-                language="ru"
+                language="ru",
             )
-        return result.strip()
+        return (result or "").strip()
     except Exception:
         pass
-
+    # Попытка старым SDK
     try:
-        # Старый SDK (openai<1.x)
         import openai
         openai.api_key = os.getenv("OPENAI_API_KEY")
         with open(path, "rb") as f:
-            result = openai.Audio.transcribe("whisper-1", f, language="ru")
-        # result — dict со строкой в поле 'text'
-        if isinstance(result, dict):
-            return (result.get("text") or "").strip()
-        return str(result).strip()
+            res = openai.Audio.transcribe("whisper-1", f, language="ru")
+        if isinstance(res, dict):
+            return (res.get("text") or "").strip()
+        return str(res).strip()
     except Exception as e:
-        log.exception("whisper legacy failed: %s", e)
+        log.exception("Whisper failed: %s", e)
         return None
 
-# ---------------------- FLASK "PORT BIND" ДЛЯ RENDER ----------------------
-app_http = Flask(__name__)
-
-@app_http.get("/")
-def health():
-    return Response("ok", mimetype="text/plain")
-
-def run_flask():
-    port = int(os.getenv("PORT", "8080"))
-    log.info("Running HTTP on 0.0.0.0:%s", port)
-    app_http.run(host="0.0.0.0", port=port)
+# ---------------------- ПОСЛЕ-ИНИЦИАЛИЗАЦИИ ----------------------
+async def _post_init(app: Application):
+    """Критично: перед polling удаляем вебхук и чистим очередь апдейтов, чтобы не было Conflict."""
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        me = await app.bot.get_me()
+        log.info("Webhook removed. Polling as @%s", me.username)
+    except Exception as e:
+        log.exception("post_init failed: %s", e)
 
 # ---------------------- ЗАПУСК ----------------------
-async def _show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
-
 def main():
-    # Поднимаем Flask в отдельном потоке (для Render)
+    # поднимем keep-alive HTTP (для Render)
     threading.Thread(target=run_flask, daemon=True).start()
 
     token = os.getenv("BOT_TOKEN")
@@ -356,16 +332,18 @@ def main():
         raise SystemExit("Нет переменной окружения BOT_TOKEN")
 
     application = Application.builder().token(token).build()
+    application.post_init = _post_init  # ← ставим хук удаления вебхука
 
-    # /start
+    # хэндлеры
     application.add_handler(CommandHandler("start", start))
-    # текстовые команды/фразы
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, set_reminder))
-    # голосовые
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, set_reminder))
 
-    log.info("Starting bot with polling...")
-    application.run_polling(close_loop=False)
+    log.info("Starting bot with polling…")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False
+    )
 
 if __name__ == "__main__":
     main()
