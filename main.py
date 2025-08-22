@@ -60,12 +60,12 @@ async def send_help(update: Update) -> None:
     text = (
         "Бот запущен ✅\n\n"
         "Примеры:\n"
-        "• напомни сегодня в 16:00 купить молоко\n"
-        "• напомни завтра в 9:15 встреча с Андреем\n"
-        "• напомни в 22:30 позвонить маме\n"
-        "• напомни через 5 минут попить воды\n"
-        "• напомни каждый день в 09:30 зарядка\n"
-        "• напомни 30 августа в 09:00 заплатить за кредит\n"
+        "• сегодня в 16:00 купить молоко\n"
+        "• завтра в 9:15 встреча с Андреем\n"
+        "• в 22:30 позвонить маме\n"
+        "• через 5 минут попить воды\n"
+        "• каждый день в 09:30 зарядка\n"
+        "• 30 августа в 09:00 заплатить за кредит\n"
         f"(часовой пояс: {tzname})"
     )
     await update.message.reply_text(text)
@@ -185,19 +185,19 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         when = now_local() + data["delta"]
         jq.run_once(remind_callback, when - now_local(), chat_id=chat_id, data=data["text"])
         await update.message.reply_text(
-            f"✅ Ок, напомню в {when.strftime('%Y-%m-%d %H:%M')} — «{data['text']}». (TZ: {TIMEZONE.zone})"
+            f"✅ Отлично, напомню в {when.strftime('%Y-%m-%d %H:%M')} — «{data['text']}». (TZ: {TIMEZONE.zone})"
         )
     elif kind == "once_at":
         dt = data["dt"]
         jq.run_once(remind_callback, dt - now_local(), chat_id=chat_id, data=data["text"])
         await update.message.reply_text(
-            f"✅ Ок, напомню {dt.strftime('%Y-%m-%d %H:%M')} — «{data['text']}». (TZ: {TIMEZONE.zone})"
+            f"✅ Отлично, напомню {dt.strftime('%Y-%m-%d %H:%M')} — «{data['text']}». (TZ: {TIMEZONE.zone})"
         )
     elif kind == "daily_at":
         tm = data["tm"]  # datetime.time с tzinfo
         jq.run_daily(remind_callback, tm, chat_id=chat_id, data=data["text"], name=f"daily:{chat_id}:{data['text']}")
         await update.message.reply_text(
-            f"✅ Ок, буду напоминать каждый день в {tm.strftime('%H:%M')} — «{data['text']}». (TZ: {TIMEZONE.zone})"
+            f"✅ Отлично, буду напоминать каждый день в {tm.strftime('%H:%M')} — «{data['text']}». (TZ: {TIMEZONE.zone})"
         )
 
 # ────────────── HEARTBEAT HTTP-СЕРВЕР (Flask) ───────────
