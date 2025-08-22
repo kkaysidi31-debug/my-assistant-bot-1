@@ -1,4 +1,5 @@
-python-telegram-bot[webhooks,job-queue]>=21,<22
+python-telegram-bot[job-queue]>=21,<22
+apscheduler>=3.10,<4
+flask>=2.2,<3
 pytz
-apscheduler>=3.10
-aiohttp
+openai>=1.30.0
