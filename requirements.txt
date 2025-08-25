@@ -1,5 +1,4 @@
 python-telegram-bot[job-queue]>=21,<22
-apscheduler>=3.10,<4
-flask>=2.2,<3
+Flask>=2.2,<3
 pytz
 openai>=1.30.0
