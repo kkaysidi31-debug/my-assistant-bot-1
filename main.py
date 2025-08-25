@@ -417,7 +417,7 @@ async def _post_init(app: Application):
         # Команды для меню в Telegram (кнопка /)
         await app.bot.set_my_commands([
             BotCommand("start", "помощь и примеры"),
-            BotCommand("affairs", "список дел / удалить: /affairs delete N"),
+            BotCommand("affairs", "список дел"),
             BotCommand("affairs_delete", "удалить дело по номеру"),
         ])
         me = await app.bot.get_me()
