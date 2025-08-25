@@ -123,7 +123,8 @@ async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     MAINTENANCE = False
     await update.message.reply_text("✅ Режим обслуживания выключен. Уведомляю пользователей…")
     to_notify = list(PENDING_CHATS)
-    PENDING_CHATS.clear()save_pending()
+    PENDING_CHATS.clear()
+    save_pending()
     for cid in to_notify:
         try:
             await context.bot.send_message(cid, "✅ Бот снова работает.")
