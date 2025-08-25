@@ -10,7 +10,7 @@ from typing import List, Dict, Any
 from flask import Flask, Response
 from pytz import timezone
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
@@ -46,7 +46,6 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=port, debug=False)
 
 # ───────────────────── ХРАНИЛИЩЕ ДЕЛ ───────────────────
-# Храним запланированные задачи в памяти процесса.
 # user_id -> список элементов:
 # { "kind": "once"|"daily", "when": datetime | None, "hh": int|None, "mm": int|None,
 #   "text": str, "job_name": str }
@@ -60,12 +59,12 @@ WELCOME_PRIVATE = "Бот приватный. Введите ключ досту
 HELP_TEXT = (
     "Бот запущен ✅\n\n"
     "Примеры:\n"
-    "• напомни сегодня в 16:00 купить молоко\n"
-    "• напомни завтра в 9:15 встреча с Андреем\n"
-    "• напомни в 22:30 позвонить маме\n"
-    "• напомни через 5 минут попить воды\n"
-    "• напомни каждый день в 09:30 зарядка\n"
-    "• напомни 30 августа в 09:00 заплатить за кредит\n"
+    "• сегодня в 16:00 купить молоко\n"
+    "• завтра в 9:15 встреча с Андреем\n"
+    "• в 22:30 позвонить маме\n"
+    "• через 5 минут попить воды\n"
+    "• каждый день в 09:30 зарядка\n"
+    "• 30 августа в 09:00 заплатить за кредит\n"
     "(часовой пояс: Europe/Kaliningrad)\n\n"
     "Команды:\n"
     "• /affairs — показать список дел\n"
@@ -84,7 +83,8 @@ RE_TIME = r"(?P<h>\d{1,2})[:.](?P<m>\d{2})"
 
 def _clean_text(s: str) -> str:
     s = (s or "").strip().lower().replace("ё", "е")
-    s = re.sub(r"^(напомни(те)?-?ка?\s+)", "", s)  # убираем «напомни ...»
+    # убираем «напомни / напомните / напомни-ка …» если пользователь добавил
+    s = re.sub(r"^(напомни(те)?-?ка?\s+)", "", s)
     s = re.sub(r"\s+", " ", s)
     return s
 
@@ -196,11 +196,10 @@ def _remember(uid: int, item: Dict[str, Any]):
     lst = SCHEDULES.setdefault(uid, [])
     lst.append(item)
 
-# Пересчёт «ближайшего времени» для сортировки (ежедневные показываем со следующего срабатывания)
+# Пересчёт «ближайшего времени» для сортировки (ежедневные — следующее срабатывание)
 def _next_time_for(item: Dict[str, Any]) -> datetime:
     if item["kind"] == "once":
         return item["when"]
-    # daily
     hh, mm = item["hh"], item["mm"]
     first = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
     if first <= now_local():
@@ -215,7 +214,7 @@ async def list_or_delete_affairs(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     args = context.args or []
-    # Если формат "delete N"
+    # Удаление: "/affairs delete N"
     if len(args) >= 1 and args[0].lower() == "delete":
         if len(args) < 2 or not args[1].isdigit():
             await update.message.reply_text("Использование: /affairs delete N (номер из списка /affairs)")
@@ -225,13 +224,12 @@ async def list_or_delete_affairs(update: Update, context: ContextTypes.DEFAULT_T
         if not items:
             await update.message.reply_text("Список дел пуст.")
             return
-        # Сортируем так же, как при выводе
         ordered = sorted(items, key=_next_time_for)
         if index < 1 or index > len(ordered):
             await update.message.reply_text(f"Нет пункта №{index}.")
             return
         to_del = ordered[index - 1]
-        # Удаляем job из JobQueue
+        # удаляем job из JobQueue
         job_name = to_del.get("job_name")
         deleted = False
         if job_name:
@@ -239,7 +237,7 @@ async def list_or_delete_affairs(update: Update, context: ContextTypes.DEFAULT_T
             for j in jobs:
                 j.schedule_removal()
                 deleted = True
-        # Удаляем из памяти
+        # удаляем из памяти
         items.remove(to_del)
         await update.message.reply_text(
             f"🗑 Удалено: {_next_time_for(to_del).strftime('%d.%m.%Y %H:%M')} — {to_del['text']}"
@@ -247,7 +245,7 @@ async def list_or_delete_affairs(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # Просто показать список
+    # Показ списка
     items = SCHEDULES.get(uid, [])
     future_items = []
     for it in items:
@@ -255,7 +253,7 @@ async def list_or_delete_affairs(update: Update, context: ContextTypes.DEFAULT_T
             if it["when"] >= now_local():
                 future_items.append(it)
         else:
-            future_items.append(it)  # daily всегда показываем
+            future_items.append(it)  # daily показываем всегда
 
     if not future_items:
         await update.message.reply_text("У вас пока нет активных дел ✅")
@@ -270,9 +268,8 @@ async def list_or_delete_affairs(update: Update, context: ContextTypes.DEFAULT_T
             lines.append(f"{i}. {it['hh']:02d}:{it['mm']:02d} — {it['text']} (ежедневно)")
     await update.message.reply_text("Ваши ближайшие дела:\n" + "\n".join(lines))
 
-# Синоним команда: /affairs_delete N
+# Синоним: /affairs_delete N
 async def affairs_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # перенаправим в общий обработчик как "/affairs delete N"
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("Использование: /affairs_delete N")
         return
@@ -292,12 +289,13 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p = parse_text(text)
     if not p:
         await update.message.reply_text(
-            "❓ Не понял формат. Используй:\n"
-            "— через N минут/часов …\n"
-            "— сегодня в HH:MM …\n"
-            "— завтра в HH:MM …\n"
-            "— каждый день в HH:MM …\n"
-            "— DD <месяц> [в HH:MM] …"
+            "❓ Не понял формат. Примеры:\n"
+            "— сегодня в 16:00 купить молоко\n"
+            "— завтра в 9:15 встреча\n"
+            "— в 22:30 позвонить маме\n"
+            "— через 5 минут попить воды\n"
+            "— каждый день в 09:30 зарядка\n"
+            "— 30 августа в 09:00 заплатить за кредит"
         )
         return
 
@@ -311,7 +309,9 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _send_text, when=delay,
             chat_id=chat_id, data=p["text"], name=job_name
         )
-        _remember(uid, {"kind":"once","when":when,"hh":None,"mm":None,"text":p["text"],"job_name":job_name})
+        # запомним
+        lst = SCHEDULES.setdefault(uid, [])
+        lst.append({"kind":"once","when":when,"hh":None,"mm":None,"text":p["text"],"job_name":job_name})
         await update.message.reply_text(
             f"✅ Ок, напомню {when.strftime('%Y-%m-%d %H:%M')} — «{p['text']}». (TZ: Europe/Kaliningrad)"
         )
@@ -322,9 +322,10 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delay = max(1, int((when - now_local()).total_seconds()))
         job_name = f"{uid}:once:{int(when.timestamp())}:{abs(hash(p['text']))%100000}"
         context.job_queue.run_once(
-            _send_text, when=delay,
-            chat_id=chat_id, data=p["text"], name=job_name)
-        _remember(uid, {"kind":"once","when":when,"hh":None,"mm":None,"text":p["text"],"job_name":job_name})
+            _send_text, when=delay,chat_id=chat_id, data=p["text"], name=job_name
+        )
+        lst = SCHEDULES.setdefault(uid, [])
+        lst.append({"kind":"once","when":when,"hh":None,"mm":None,"text":p["text"],"job_name":job_name})
         await update.message.reply_text(
             f"✅ Ок, напомню {when.strftime('%Y-%m-%d %H:%M')} — «{p['text']}». (TZ: Europe/Kaliningrad)"
         )
@@ -333,18 +334,17 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "daily_at" in p:
         hh = p["daily_at"].hour
         mm = p["daily_at"].minute
-        # Расчёт первого запуска для информации
         first = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
         if first <= now_local():
             first += timedelta(days=1)
         job_name = f"{uid}:daily:{hh:02d}{mm:02d}:{abs(hash(p['text']))%100000}"
-        # run_repeating раз в 24 часа, first — время до первого
         delay = max(1, int((first - now_local()).total_seconds()))
         context.job_queue.run_repeating(
             _send_text, interval=24*60*60, first=delay,
             chat_id=chat_id, data=p["text"], name=job_name
         )
-        _remember(uid, {"kind":"daily","when":None,"hh":hh,"mm":mm,"text":p["text"],"job_name":job_name})
+        lst = SCHEDULES.setdefault(uid, [])
+        lst.append({"kind":"daily","when":None,"hh":hh,"mm":mm,"text":p["text"],"job_name":job_name})
         await update.message.reply_text(
             f"✅ Ок, буду напоминать каждый день в {hh:02d}:{mm:02d} — «{p['text']}». (TZ: Europe/Kaliningrad)"
         )
@@ -409,15 +409,22 @@ async def transcribe_ogg(path: str) -> str | None:
         log.exception("whisper legacy failed: %s", e)
         return None
 
-# ───────────── ПОСЛЕ-ИНИЦИАЛИЗАЦИИ (anti-conflict) ────────────
+# ───────────── ПОСЛЕ-ИНИЦИАЛИЗАЦИИ (anti-conflict + меню) ────────────
 async def _post_init(app: Application):
     try:
+        # Удаляем вебхук и чистим очередь — чтобы polling не конфликтовал
         await app.bot.delete_webhook(drop_pending_updates=True)
+        # Команды для меню в Telegram (кнопка /)
+        await app.bot.set_my_commands([
+            BotCommand("start", "помощь и примеры"),
+            BotCommand("affairs", "список дел / удалить: /affairs delete N"),
+            BotCommand("affairs_delete", "удалить дело по номеру"),
+        ])
         me = await app.bot.get_me()
-        log.info("Webhook removed. Polling as @%s", me.username)
+        log.info("Webhook removed, commands set. Polling as @%s", me.username)
     except Exception as e:
         log.exception("post_init failed: %s", e)
-
+        
 # ───────────────────────── ЗАПУСК ───────────────────────
 def main():
     # поднимем heartbeat веб-сервер
