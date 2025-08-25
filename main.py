@@ -126,12 +126,14 @@ def normalize_minutes_hours(n: int, unit: str) -> timedelta:
 # =============== РАСПОЗНАВАНИЕ РЕЧИ (опционально) ===============
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # если нет, голос обрабатывать не будем
 openai_client = None
+
 if OPENAI_API_KEY:
     try:
         from openai import OpenAI
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
         log.info("OpenAI client initialized for voice transcription.")
-    except Exception as e:log.warning("Failed to init OpenAI client: %s", e)
+    except Exception as e:
+        log.warning("Failed to init OpenAI client: %s", e)
         openai_client = None
 
 async def transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
