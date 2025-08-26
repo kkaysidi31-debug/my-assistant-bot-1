@@ -129,7 +129,7 @@ async def handle_key_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ACCESS_KEYS[msg] = uid
             ALLOWED_USERS.add(uid)
             save_db()
-     await update.message.reply_text("Ключ принят ✅. Теперь можно ставить напоминания.")
+            await update.message.reply_text("Ключ принят ✅. Теперь можно ставить напоминания.")
         else:
             await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
         return
