@@ -1,4 +1,2 @@
-python-telegram-bot[webhooks,job-queue]>=21,<22
-pytz
-flask
-openai
+python-telegram-bot==20.3
+pytz==2023.3
