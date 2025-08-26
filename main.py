@@ -1,279 +1,156 @@
-# -*- coding: utf-8 -*-
 import os
 import re
 import json
-import asyncio
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, time
-from zoneinfo import ZoneInfo
-from typing import Dict, Any, List, Optional, Tuple, Set
+import uuid
+import logging
+from datetime import datetime, timedelta, time as dtime
+from typing import Dict, Any, List
 
+import pytz
+from aiohttp import web
 from telegram import Update, BotCommand
-from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters,
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# =============== НАСТРОЙКИ ===============
-ADMIN_ID = 963586834  # ваш ID
-TZ = ZoneInfo("Europe/Kaliningrad")
+# ---------- Конфиг ----------
+ADMIN_ID = 963586834                      # твой ID
+TIMEZONE = pytz.timezone("Europe/Kaliningrad")
 DB_FILE = "db.json"
 
-# Генерим ключи VIP001..VIP100
-ACCESS_KEYS: Dict[str, Optional[int]] = {f"VIP{n:03d}": None for n in range(1, 101)}
+# Ключи доступа VIP001..VIP100
+ACCESS_KEYS = [f"VIP{str(i).zfill(3)}" for i in range(1, 101)]
+ALLOWED_USERS = set()
+USED_KEYS = set()
 
-# Список русских месяцев (в родительном падеже не требуем — для простоты)
+MAINTENANCE = False
+PENDING_CHATS = set()  # кому отправить "бот снова работает"
+
+# ---------- Логирование ----------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("reminder-bot")
+
+# ---------- Хранилище ----------
+def load_db() -> Dict[str, Any]:
+    if not os.path.exists(DB_FILE):
+        return {"allowed_users": [], "used_keys": [], "tasks": {}}
+    with open(DB_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_db(db: Dict[str, Any]) -> None:
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+def boot_db():
+    db = load_db()
+    ALLOWED_USERS.update(db.get("allowed_users", []))
+    USED_KEYS.update(db.get("used_keys", []))
+    return db
+
+DB = boot_db()
+
+def persist_users():
+    DB["allowed_users"] = sorted(list(ALLOWED_USERS))
+    DB["used_keys"] = sorted(list(USED_KEYS))
+    save_db(DB)
+
+def user_tasks(uid: int) -> List[Dict[str, Any]]:
+    DB.setdefault("tasks", {})
+    return DB["tasks"].setdefault(str(uid), [])
+
+def add_task(uid: int, task: Dict[str, Any]):
+    tasks = user_tasks(uid)
+    tasks.append(task)
+    save_db(DB)
+
+def remove_task(uid: int, job_id: str) -> bool:
+    tasks = user_tasks(uid)
+    before = len(tasks)
+    DB["tasks"][str(uid)] = [t for t in tasks if t["job_id"] != job_id]
+    save_db(DB)
+    return len(DB["tasks"][str(uid)]) < before
+
+# ---------- Утилиты времени ----------
+def now_local() -> datetime:
+    return datetime.now(TIMEZONE)
+
 MONTHS = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
     "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
-    # поддержим и именительный
     "январь": 1, "февраль": 2, "март": 3, "апрель": 4, "июнь": 6, "июль": 7,
     "август": 8, "сентябрь": 9, "октябрь": 10, "ноябрь": 11, "декабрь": 12,
 }
 
-# =============== ХРАНИЛКА ===============
-def now_local() -> datetime:
-    return datetime.now(TZ)
-
-@dataclass
-class Task:
-    chat_id: int
-    when_iso: str            # ISO время (локальное)
-    text: str
-    kind: str                # "once" | "daily"
-    job_id: str
-
-DB: Dict[str, Any] = {
-    "allowed_users": [],          # list[int]
-    "access_keys": ACCESS_KEYS,   # dict[str, Optional[int]]
-    "tasks": [],                  # list[Task dict]
-    "maintenance": False,
-    "pending_chats": []           # list[int] — кому отписать после техработ
-}
-
-def load_db() -> None:
-    global DB
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                DB.update(json.load(f))
-        except Exception:
-            pass
-    else:
-        save_db()
-
-def save_db() -> None:
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(DB, f, ensure_ascii=False, indent=2)
-
-def allowed_users() -> Set[int]:
-    return set(DB.get("allowed_users", []))
-
-def is_allowed(uid: int) -> bool:
-    return uid in allowed_users() or uid == ADMIN_ID
-
-# =============== ПАРСИНГ ЕСТЕСТВЕННОГО ЯЗЫКА ===============
 RE_TIME = r"(?P<h>\d{1,2}):(?P<m>\d{2})"
 
-def parse_text(t: str) -> Optional[Dict[str, Any]]:
+def parse_text(txt: str) -> Dict[str, Any] | None:
     """
-    Возвращает dict:
-      {"type": "once", "dt": datetime, "text": "..."}  или
-      {"type": "daily", "t": time, "text": "..."}
-    Поддержка:
-      — "через N минут/часов ..."
-      — "сегодня в HH:MM ..."
-      — "завтра в HH:MM ..."
-      — "каждый день в HH:MM ..."
-      — "DD <месяц> [в HH:MM] ..."
-      — "сегодня в HH:MM ... в HH:MM ..." (первое время — сигнал, второе — само напоминание)
+    Возвращает:
+      {"kind":"in","delta":timedelta,"text":...}
+      {"kind":"today","dt":datetime,"text":...}
+      {"kind":"tomorrow","dt":datetime,"text":...}
+      {"kind":"daily","t":datetime.time,"text":...}
+      {"kind":"date","dt":datetime,"text":...}
     """
-    t = t.strip().lower()
+    t = " ".join(txt.split()).lower()
 
     # 1) через N минут/часов ...
-    m = re.match(r"через\s+(?P<n>\d+)\s*(мин|минут|минуты)\b\s*(?P<txt>.*)", t)
+    m = re.match(r"^через\s+(?P<n>\d+)\s*(минут(?:ы)?|мин|час(?:а|ов)?)\s+(?P<text>.+)$", t)
     if m:
         n = int(m.group("n"))
-        dt = now_local() + timedelta(minutes=n)
-        txt = m.group("txt").strip() or "дело"
-        return {"type": "once", "dt": dt, "text": txt}
-
-    m = re.match(r"через\s+(?P<n>\d+)\s*(час|часа|часов)\b\s*(?P<txt>.*)", t)
-    if m:
-        n = int(m.group("n"))
-        dt = now_local() + timedelta(hours=n)
-        txt = m.group("txt").strip() or "дело"
-        return {"type": "once", "dt": dt, "text": txt}
+        unit = m.group(2)
+        delta = timedelta(minutes=n) if unit.startswith("мин") else timedelta(hours=n)
+        return {"kind": "in", "delta": delta, "text": m.group("text").strip()}
 
     # 2) сегодня в HH:MM ...
-    m = re.match(rf"сегодня\s*в\s*{RE_TIME}\s*(?P<txt>.+)", t)
-    if m:
-        hh, mm = int(m.group("h")), int(m.group("m"))
-        dt = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
-        # если время уже прошло — на завтра
-        if dt <= now_local():
-            dt += timedelta(days=1)
-        return {"type": "once", "dt": dt, "text": m.group("txt").strip()}
-
-    # 3) завтра в HH:MM ...
-    m = re.match(rf"завтра\s*в\s*{RE_TIME}\s*(?P<txt>.+)", t)
+    m = re.match(rf"^сегодня\s+в\s+{RE_TIME}\s+(?P<text>.+)$", t)
     if m:
         hh, mm = int(m.group("h")), int(m.group("m"))
         base = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
-        dt = base + timedelta(days=1)
-        return {"type": "once", "dt": dt, "text": m.group("txt").strip()}
+        return {"kind": "today", "dt": base, "text": m.group("text").strip()}
 
-    # 4) каждый день в HH:MM ...
-    m = re.match(rf"(каждый\s*день|ежедневно)\s*в\s*{RE_TIME}\s*(?P<txt>.+)", t)
+    # 3) завтра в HH:MM ...
+    m = re.match(rf"^завтра\s+в\s+{RE_TIME}\s+(?P<text>.+)$", t)
     if m:
         hh, mm = int(m.group("h")), int(m.group("m"))
-        return {"type": "daily", "t": time(hour=hh, minute=mm, tzinfo=TZ), "text": m.group("txt").strip()}
+        base = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0) + timedelta(days=1)
+        return {"kind": "tomorrow", "dt": base, "text": m.group("text").strip()}
 
-    # 5) DD <месяц> [в HH:MM] ...
+    # 4) каждый день в HH:MM ...
+    m = re.match(rf"^каждый\s+день\s+в\s+{RE_TIME}\s*(?P<text>.+)$", t)
+    if m:
+        hh, mm = int(m.group("h")), int(m.group("m"))
+        return {"kind": "daily", "t": dtime(hh, mm, tzinfo=TIMEZONE), "text": m.group("text").strip()}
+
+    # 5) "30 августа [в 09:00] ..."
     m = re.match(
-        rf"(?P<d>\d{{1,2}})\s+(?P<mon>[а-я]+)(?:\s*в\s*{RE_TIME})?\s*(?P<txt>.+)",
+        rf"^(?P<d>\d{{1,2}})\s+(?P<mon>[а-я]+)(?:\s+в\s+{RE_TIME})?\s*(?P<text>.+)$",
         t
     )
     if m and m.group("mon") in MONTHS:
-        d = int(m.group("d"))
+        day = int(m.group("d"))
         mon = MONTHS[m.group("mon")]
         hh = int(m.group("h")) if m.group("h") else 9
         mm = int(m.group("m")) if m.group("m") else 0
-        y = now_local().year
-        dt = datetime(y, mon, d, hh, mm, tzinfo=TZ)
-        if dt <= now_local():
-            # если дата прошла — считаем, что речь о следующем году
-            dt = datetime(y + 1, mon, d, hh, mm, tzinfo=TZ)
-        return {"type": "once", "dt": dt, "text": m.group("txt").strip()}
-
-    # 6) «сигнал/предупреждение»: сегодня в 14:00 ... в 15:00 ...
-    m = re.match(
-        rf"сегодня\s*в\s*{RE_TIME}.*?\bв\s*(?P<h2>\d{{1,2}}):(?P<m2>\d{{2}})\s*(?P<txt>.+)",
-        t
-    )
-    if m:
-        # первое время игнорируем (сигнал) — ставим на второе
-        hh2, mm2 = int(m.group("h2")), int(m.group("m2"))
-        dt = now_local().replace(hour=hh2, minute=mm2, second=0, microsecond=0)
-        if dt <= now_local():
-            dt += timedelta(days=1)
-        return {"type": "once", "dt": dt, "text": m.group("txt").strip()}
+        year = now_local().year
+        dt = TIMEZONE.localize(datetime(year, mon, day, hh, mm, 0))
+        return {"kind": "date", "dt": dt, "text": m.group("text").strip()}
 
     return None
 
-# =============== ПЛАНИРОВАНИЕ ===============
-def make_job_id(chat_id: int, when: datetime, text: str) -> str:
-    return f"{chat_id}:{int(when.timestamp())}:{abs(hash(text))%10_000_000}"
-
-async def fire_reminder(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    data = ctx.job.data
-    chat_id = data["chat_id"]
-    text = data["text"]
-    when_iso = data["when_iso"]
+# ---------- Напоминалка ----------
+async def remind_callback(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    data = ctx.job.data or {}
+    chat_id = data.get("chat_id")
+    text = data.get("text", "Напоминание")
     try:
         await ctx.bot.send_message(chat_id, f"⏰ {text}")
     finally:
-        # одноразовое удаляем из БД
-        DB["tasks"] = [t for t in DB["tasks"] if not (t["chat_id"] == chat_id and t["when_iso"] == when_iso and t["text"] == text and t["kind"] == "once")]
-        save_db()
+        # для разовых задач удаляем из БД
+        if data.get("one_time") and chat_id and ctx.job:
+            remove_task(chat_id, ctx.job.name)
 
-def schedule_existing(app: Application) -> None:
-    for t in DB.get("tasks", []):
-        if t["kind"] == "once":
-            dt = datetime.fromisoformat(t["when_iso"])
-            if dt > now_local():
-                app.job_queue.run_once(
-                    fire_reminder,
-                    when=dt - now_local(),
-                    data={"chat_id": t["chat_id"], "text": t["text"], "when_iso": t["when_iso"]},
-                    name=t["job_id"]
-                )
-        elif t["kind"] == "daily":
-            hhmm = datetime.fromisoformat(t["when_iso"]).time()
-            app.job_queue.run_daily(
-                fire_reminder,
-                time=hhmm,
-                data={"chat_id": t["chat_id"], "text": t["text"], "when_iso": t["when_iso"]},
-                name=t["job_id"]
-            )
-
-def add_task_once(app: Application, chat_id: int, dt: datetime, text: str) -> Task:
-    job_id = make_job_id(chat_id, dt, text)
-    app.job_queue.run_once(
-        fire_reminder,
-        when=dt - now_local(),
-        data={"chat_id": chat_id, "text": text, "when_iso": dt.isoformat()},
-        name=job_id
-    )
-    task = Task(chat_id=chat_id, when_iso=dt.isoformat(), text=text, kind="once", job_id=job_id)
-    DB["tasks"].append(asdict(task))
-    save_db()
-    return task
-
-def add_task_daily(app: Application, chat_id: int, t: time, text: str) -> Task:
-    # when_iso храним как сегодня+это время (для удобного ISO)
-    ref = now_local().replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
-    job_id = make_job_id(chat_id, ref, text)
-    app.job_queue.run_daily(
-        fire_reminder,
-        time=t,
-        data={"chat_id": chat_id, "text": text, "when_iso": ref.isoformat()},
-        name=job_id
-    )
-    task = Task(chat_id=chat_id, when_iso=ref.isoformat(), text=text, kind="daily", job_id=job_id)
-    DB["tasks"].append(asdict(task))
-    save_db()
-    return task
-
-# =============== ГОЛОС ===============
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_allowed(uid):
-        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
-        return
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        await update.message.reply_text("🎙 Распознавание голоса не настроено (нет OPENAI_API_KEY). Отправьте текстом.")
-        return
-
-    # Скачиваем voice как ogg
-    file = await context.bot.get_file(update.message.voice.file_id)
-    b = await file.download_as_bytearray()
-
-    # Отправляем в Whisper
-    try:
-        import aiohttp
-        form = aiohttp.FormData()
-        form.add_field("file", b, filename="audio.ogg", content_type="audio/ogg")
-        form.add_field("model", "whisper-1")
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                data=form,
-                headers={"Authorization": f"Bearer {api_key}"}
-            ) as resp:
-                js = await resp.json()
-        text = js.get("text", "").strip()
-        if not text:
-            await update.message.reply_text("Не удалось распознать голос. Попробуйте короче и чётче.")
-            return
-        # Скормим распознанный текст обработчику
-        update.message.text = text
-        await handle_key_or_text(update, context)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка распознавания: {e}")
-
-# =============== ТЕХРАБОТЫ ===============
-def maintenance_on() -> None:
-    DB["maintenance"] = True
-    save_db()
-
-def maintenance_off() -> None:
-    DB["maintenance"] = False
-    save_db()
-
-# =============== ХЕЛПЕРЫ ВЫВОДА ===============
+# ---------- Команды ----------
 HELP_TEXT = (
     "Бот запущен ✅\n\n"
     "Примеры:\n"
@@ -283,181 +160,254 @@ HELP_TEXT = (
     "• через 5 минут попить воды\n"
     "• каждый день в 09:30 зарядка\n"
     "• 30 августа в 09:00 заплатить за кредит\n"
-    "• Сегодня в 14:00 (сигнал) напоминаю, встреча в 15:00 (само напоминание)\n"
-    f"(часовой пояс: {TZ.key})"
+    "• Сегодня в 14:00 (сигнал) напоминаю, встреча в 15:00 (само напоминание в 15:00)\n"
+    "(часовой пояс: Europe/Kaliningrad)"
 )
 
-def format_affairs(chat_id: int) -> str:
-    items = []
-    for i, t in enumerate(sorted([x for x in DB["tasks"] if x["chat_id"] == chat_id],
-                                 key=lambda x: x["when_iso"])) :
-        mark = "ежедневно" if t["kind"] == "daily" else datetime.fromisoformat(t["when_iso"]).strftime("%d.%m.%Y %H:%M")
-        items.append(f"{i+1}. {mark} — {t['text']}")
-    return "Ваши ближайшие дела:\n" + ("\n".join(items) if items else "пока пусто")
-
-# =============== ХЕНДЛЕРЫ ===============
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_allowed(uid):
-        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
-        return
-    await update.message.reply_text(HELP_TEXT)
-
-async def cmd_affairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_allowed(uid):
-        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
-        return
-    await update.message.reply_text(format_affairs(update.effective_chat.id))
-
-async def cmd_affairs_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_allowed(uid):
-        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
-        return
-    if not context.args:
-        await update.message.reply_text("Укажите номер: /affairs_delete 2")
-        return
-    try:
-        idx = int(context.args[0]) - 1
-    except:
-        await update.message.reply_text("Номер должен быть целым.")
-        return
-    my_tasks = [t for t in DB["tasks"] if t["chat_id"] == update.effective_chat.id]
-    if not (0 <= idx < len(my_tasks)):
-        await update.message.reply_text("Неверный номер.")
-        return
-    victim = my_tasks[idx]
-    # остановим job
-    j = context.application.job_queue.get_jobs_by_name(victim["job_id"])
-    for job in j:
-        job.schedule_removal()
-    # удалим из БД
-    DB["tasks"] = [t for t in DB["tasks"] if t != victim]
-    save_db()
-    await update.message.reply_text("Удалил. ✅")
-
-async def cmd_maintenance_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    maintenance_on()
-    await update.message.reply_text("⚠️ Технические работы включены.")
-async def cmd_maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    maintenance_off()
-    await update.message.reply_text("✅ Технические работы выключены.")
-    # уведомим ожидавших
-    chats = set(DB.get("pending_chats", []))
-    DB["pending_chats"] = []
-    save_db()
-    for cid in chats:
-        try:
-            await context.bot.send_message(cid, "✅ Бот снова работает.")
-        except:
-            pass
-
-async def handle_key_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (update.message.text or "").strip()
-    uid = update.effective_user.id
-    chat_id = update.effective_chat.id
-
-    # 1) Авторизация по ключу
-    if not is_allowed(uid):
-        if re.fullmatch(r"VIP\d{3}", msg):
-            if msg in DB["access_keys"] and DB["access_keys"][msg] is None:
-                DB["access_keys"][msg] = uid
-                DB["allowed_users"] = sorted(list(allowed_users() | {uid}))
-                save_db()
-                await update.message.reply_text("Ключ принят ✅. Теперь можно ставить напоминания.")
-                await update.message.reply_text(HELP_TEXT)
-            else:
-                await update.message.reply_text("Ключ недействителен или уже использован.")
-        else:
-            await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
-        return
-
-    # 2) Техработы
-    if DB.get("maintenance", False) and uid != ADMIN_ID:
-        s = "⚠️ Уважаемый пользователь, сейчас ведутся технические работы. Как только бот возобновит работу — мы сообщим."
-        await update.message.reply_text(s)
-        # запомним чат
-        pend = set(DB.get("pending_chats", []))
-        pend.add(chat_id)
-        DB["pending_chats"] = list(pend)
-        save_db()
-        return
-
-    # 3) Разбор естественного языка
-    parsed = parse_text(msg.lower())
-    if not parsed:
-        await update.message.reply_text(
-            "❓ Не понял формат. Примеры выше — нажмите /start"
-        )
-        return
-
-    if parsed["type"] == "once":
-        task = add_task_once(context.application, chat_id, parsed["dt"], parsed["text"])
-        dt = datetime.fromisoformat(task.when_iso)
-        await update.message.reply_text(
-            f"✅ Ок, напомню {dt.strftime('%Y-%m-%d %H:%M')} — «{parsed['text']}». (TZ: {TZ.key})"
-        )
-    else:
-        task = add_task_daily(context.application, chat_id, parsed["t"], parsed["text"])
-        t = datetime.fromisoformat(task.when_iso).strftime("%H:%M")
-        await update.message.reply_text(f"✅ Ок, напомню каждый день в {t} — «{parsed['text']}».")
-# =============== WEBHOOK ЗАПУСК ===============
-async def set_bot_commands(app: Application):
+async def set_commands(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Помощь и примеры"),
         BotCommand("affairs", "Список дел"),
-        BotCommand("affairs_delete", "Удалить дело по номеру: /affairs_delete N"),
+        BotCommand("affairs_delete", "Удалить дело по номеру"),
         BotCommand("maintenance_on", "Техработы: включить (админ)"),
         BotCommand("maintenance_off", "Техработы: выключить (админ)"),
     ])
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ALLOWED_USERS:
+        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
+        return
+    await update.message.reply_text(HELP_TEXT)
+
+async def affairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    tasks = user_tasks(uid)
+    if not tasks:
+        await update.message.reply_text("Пока пусто ✨")
+        return
+    # сортировка: сначала ближайший
+    def _key(t):
+        if t["type"] == "daily":
+            return ("1", t["time"])  # daily после разовых
+        return ("0", t["when"])
+    tasks_sorted = sorted(tasks, key=_key)
+    lines = ["Ваши ближайшие дела:"]
+    for i, t in enumerate(tasks_sorted, 1):
+        if t["type"] == "daily":
+            lines.append(f"{i}. каждый день в {t['time']} — {t['text']}")
+        else:
+            lines.append(f"{i}. {t['when']} — {t['text']}")
+    await update.message.reply_text("\n".join(lines))
+
+async def affairs_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("Укажите номер: /affairs_delete 2")
+        return
+    try:
+        n = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Номер должен быть числом.")
+        return
+
+    tasks_sorted = sorted(user_tasks(uid), key=lambda t: (t["type"] != "once", t.get("when","9999")))
+    if not (1 <= n <= len(tasks_sorted)):
+        await update.message.reply_text("Нет задачи с таким номером.")
+        return
+
+    task = tasks_sorted[n-1]
+    job_id = task["job_id"]
+    # попытка отменить
+    job = context.job_queue.get_jobs_by_name(job_id)
+    for j in job:
+        j.schedule_removal()
+    removed = remove_task(uid, job_id)
+    await update.message.reply_text("Удалено ✅" if removed else "Не нашёл такую задачу.")
+
+async def maintenance_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid != ADMIN_ID: 
+        return global MAINTENANCE
+    MAINTENANCE = True
+    await update.message.reply_text("🟡 Технические работы включены.")
+
+async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        return
+    global MAINTENANCE
+    MAINTENANCE = False
+    await update.message.reply_text("🟢 Технические работы выключены.")
+    # уведомим ожидавших
+    while PENDING_CHATS:
+        cid = PENDING_CHATS.pop()
+        try:
+            await context.bot.send_message(cid, "✅ Бот снова работает.")
+        except Exception:
+            pass
+
+# ---------- Голосовые ----------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ALLOWED_USERS:
+        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
+        return
+    if MAINTENANCE and uid != ADMIN_ID:
+        PENDING_CHATS.add(update.effective_chat.id)
+        await update.message.reply_text("🟡 Ведутся техработы. Сообщим, когда бот будет доступен.")
+        return
+    if not OPENAI_API_KEY:
+        await update.message.reply_text("Для распознавания речи не задан OPENAI_API_KEY.")
+        return
+
+    try:
+        file = await update.message.voice.get_file()
+        path = f"/tmp/{uuid.uuid4()}.oga"
+        await file.download_to_drive(path)
+
+        # OpenAI (whisper-1)
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        with open(path, "rb") as f:
+            tr = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                response_format="text",
+                language="ru"
+            )
+        text = tr.strip()
+        if not text:
+            await update.message.reply_text("Не удалось распознать голосовое.")
+            return
+        # прогоняем как обычный текст
+        update.message.text = text
+        await handle_key_or_text(update, context)
+    except Exception as e:
+        log.exception("voice error: %s", e)
+        await update.message.reply_text("Ошибка распознавания голосового.")
+
+# ---------- Обработчик текста/ключей ----------
+async def handle_key_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MAINTENANCE
+    msg = (update.message.text or "").strip()
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # 1) если не авторизован — пробуем ключ
+    if uid not in ALLOWED_USERS:
+        if re.fullmatch(r"VIP\d{3}", msg) and msg in ACCESS_KEYS and msg not in USED_KEYS:
+            USED_KEYS.add(msg)
+            ALLOWED_USERS.add(uid)
+            persist_users()
+            await update.message.reply_text("Ключ принят ✅. Теперь можно ставить напоминания.")
+            await update.message.reply_text(HELP_TEXT)
+        else:
+            await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
+        return
+
+    # 2) техработы
+    if MAINTENANCE and uid != ADMIN_ID:
+        PENDING_CHATS.add(chat_id)
+        await update.message.reply_text("🟡 Уважаемый пользователь, ведутся техработы. Напишем, когда бот снова заработает.")
+        return
+
+    # 3) парсинг естественного языка
+    parsed = parse_text(msg)
+    if not parsed:
+        await update.message.reply_text(
+            "❓ Не понял. Примеры:\n"
+            "— через 5 минут попить воды\n"
+            "— сегодня в 16:00 купить молоко\n"
+            "— завтра в 9:15 встреча с Андреем\n"
+            "— каждый день в 09:30 зарядка\n"
+            "— 30 августа в 09:00 заплатить за кредит"
+        )
+        return
+
+    jq = context.job_queue
+    text = parsed["text"]
+    job_id = f"job-{uuid.uuid4().hex}"
+
+    if parsed["kind"] == "in":
+        when = now_local() + parsed["delta"]
+        await jq.run_once(
+            remind_callback, when=when,
+            data={"chat_id": chat_id, "text": text, "one_time": True},
+            name=job_id
+        )
+        add_task(uid, {"type": "once", "when": when.strftime("%Y-%m-%d %H:%M"), "text": text, "job_id": job_id})
+        await update.message.reply_text(f"✅ Ок, напомню через {parsed['delta']} — «{text}».")
+        return
+
+    if parsed["kind"] in ("today", "tomorrow", "date"):
+        when = parsed["dt"]
+        await jq.run_once(
+            remind_callback, when=when,
+            data={"chat_id": chat_id, "text": text, "one_time": True},
+            name=job_id
+        )
+        add_task(uid, {"type": "once", "when": when.strftime("%Y-%m-%d %H:%M"), "text": text, "job_id": job_id})
+        await update.message.reply_text(f"✅ Ок, напомню {when.strftime('%Y-%m-%d %H:%M')} — «{text}». (TZ: {TIMEZONE})")
+        return
+
+    if parsed["kind"] == "daily":
+        t: dtime = parsed["t"]
+        await jq.run_daily(
+            remind_callback, time=t,
+            data={"chat_id": chat_id, "text": text, "one_time": False},
+            name=job_id
+        )
+        add_task(uid, {"type": "daily", "time": t.strftime('%H:%M'), "text": text, "job_id": job_id})
+        await update.message.reply_text(f"✅ Ежедневно в {t.strftime('%H:%M')} — «{text}».")
+        return
+
+# ---------- Сборка приложения ----------
 def build_application() -> Application:
-    token = os.getenv("BOT_TOKEN")
+    token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Нет переменной окружения BOT_TOKEN")
-    app = Application.builder().token(token).build()
 
-    # хендлеры
+    app = Application.builder().token(token).post_init(set_commands).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("affairs", cmd_affairs))
-    app.add_handler(CommandHandler("affairs_delete", cmd_affairs_delete))
-    app.add_handler(CommandHandler("maintenance_on", cmd_maintenance_on))
-    app.add_handler(CommandHandler("maintenance_off", cmd_maintenance_off))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(CommandHandler("affairs", affairs))
+    app.add_handler(CommandHandler("affairs_delete", affairs_delete))
+    app.add_handler(CommandHandler("maintenance_on", maintenance_on))
+    app.add_handler(CommandHandler("maintenance_off", maintenance_off))
+
+    app.add_handler(MessageHandler(filters.VOICE & ~filters.COMMAND, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_key_or_text))
 
     return app
 
+# ---------- Webhook ----------
 def main():
-    load_db()
     app = build_application()
-    schedule_existing(app)
 
-    # Установим команды (без await тут нельзя — используем post_init)
-    async def post_init(_: Application):
-        await set_bot_commands(app)
+    # aiohttp-приложение для health-check
+    aio = web.Application()
+    async def health(_: web.Request):
+        return web.Response(text="OK")
+    aio.router.add_get("/", health)
+    aio.router.add_get("/healthz", health)
 
-    app.post_init = post_init
-
-    public_url = os.getenv("RENDER_EXTERNAL_URL")
-    if not public_url:
-        raise SystemExit("Нет переменной окружения RENDER_EXTERNAL_URL")
     port = int(os.getenv("PORT", "10000"))
-    path = os.getenv("BOT_TOKEN")  # закрытый путь вебхука
-    webhook_url = f"{public_url.rstrip('/')}/{path}"
+    public_url = os.getenv("WEBHOOK_URL", "").rstrip("/")
+    if not public_url:
+        raise SystemExit("Нет переменной окружения WEBHOOK_URL (https://<твой-сервис>.onrender.com)")
 
+    # Telegram будет бить в корень "/", Render терминирует TLS ↔️ наш HTTP
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
-        url_path=path,
-        webhook_url=webhook_url,
+        url_path="",                        # слушаем POST на /
+        webhook_url=public_url,             # внешний https-URL сервиса
+        web_app=aio,
         drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
+        allowed_updates=Update.ALL_TYPES
     )
 
 if __name__ == "__main__":
