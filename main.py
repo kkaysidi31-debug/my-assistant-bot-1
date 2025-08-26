@@ -1,76 +1,63 @@
-import os
 import logging
-import sqlite3
+import re
+import json
 from datetime import datetime, timedelta
-
-from flask import Flask, request
+import pytz
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, filters
 )
 
-# === Конфигурация ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+# ========== НАСТРОЙКИ ==========
+BOT_TOKEN = "ТОКЕН_ОТ_БОТФАЗЕРА"
+ADMIN_ID = 123456789     # твой telegram id
+TIMEZONE = pytz.timezone("Europe/Kaliningrad")
+DATA_FILE = "data.json"
 
-# === Глобальные переменные ===
+# Ключи доступа
+ACCESS_KEYS = {"VIP001": None, "VIP002": None}
+ALLOWED_USERS = set()
+
+# Техработы
 MAINTENANCE = False
 PENDING_CHATS = set()
-ALLOWED_USERS = set()
-ACCESS_KEYS = {"VIP001": None}
 
-# === Логирование ===
+# ======= ЛОГИ =========
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# === База данных ===
-def init_db():
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        chat_id INTEGER,
-        text TEXT,
-        run_at TEXT
-    )
-    """)
-    conn.commit()
-    conn.close()
+# ======= БАЗА =========
+def load_db():
+    global ALLOWED_USERS, ACCESS_KEYS
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ALLOWED_USERS = set(data.get("allowed_users", []))
+        ACCESS_KEYS = data.get("access_keys", ACCESS_KEYS)
+    except FileNotFoundError:
+        save_db()
 
-def save_task(user_id, chat_id, text, run_at):
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("INSERT INTO tasks (user_id, chat_id, text, run_at) VALUES (?, ?, ?, ?)",
-                (user_id, chat_id, text, run_at))
-    conn.commit()
-    conn.close()
+def save_db():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump({"allowed_users": list(ALLOWED_USERS),
+                   "access_keys": ACCESS_KEYS}, f)
 
-def remove_task(user_id, task_id):
-    conn = sqlite3.connect("tasks.db")
-    cur = conn.cursor()
-    cur.execute("DELETE FROM tasks WHERE id=? AND user_id=?", (task_id, user_id))
-    conn.commit()
-    removed = cur.rowcount > 0
-    conn.close()
-    return removed
-
-# === Хэндлеры ===
+# ======= СТАРТ =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Бот запущен ✅\n\n"
-        "Примеры:\n"
+        "Бот запущен ✅\n\nПримеры:\n"
         "• сегодня в 16:00 купить молоко\n"
-        "• завтра в 9:15 встреча\n"
+        "• завтра в 9:15 встреча с Андреем\n"
         "• в 22:30 позвонить маме\n"
         "• через 5 минут попить воды\n"
         "• каждый день в 09:30 зарядка\n"
         "• 30 августа в 09:00 заплатить за кредит\n"
-        "• сегодня в 14:00 (сигнал) напоминание\n"
+        "• Сегодня в 14:00 (сигнал) напоминалка\n\n"
+        "(часовой пояс: Europe/Kaliningrad)"
     )
 
+# ======= ТЕХРАБОТЫ =========
 async def maintenance_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global MAINTENANCE
     if update.effective_user.id != ADMIN_ID:
@@ -84,77 +71,91 @@ async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     MAINTENANCE = False
     await update.message.reply_text("🟢 Технические работы выключены.")
-    # Уведомим ожидавших
+    # уведомим ожидавших
     while PENDING_CHATS:
         cid = PENDING_CHATS.pop()
         try:
-            await context.bot.send_message(cid, "✅ Бот снова работает!")
+            await context.bot.send_message(cid, "✅ Бот снова доступен!")
         except:
             pass
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ALLOWED_USERS
-    msg = update.message.text.strip()
-    uid = update.effective_user.id
-    chat_id = update.effective_chat.id
+# ======= ДОБАВЛЕНИЕ НАПОМИНАНИЙ =========
+TASKS = {}
 
-    # Проверка приватности
-    if uid not in ALLOWED_USERS:
-        if msg in ACCESS_KEYS:
-            ALLOWED_USERS.add(uid)
-            await update.message.reply_text("Ключ принят ✅. Теперь можно ставить напоминания.")
-        else:
-            await update.message.reply_text("Бот приватный. Введите ключ доступа.")
-        return
+def save_task(uid, chat_id, text, run_at):
+    tid = str(len(TASKS) + 1)
+    TASKS[tid] = {"uid": uid, "chat": chat_id, "text": text, "time": run_at}
+    return tid
 
-    # Проверка техработ
-    if MAINTENANCE and uid != ADMIN_ID:
-        PENDING_CHATS.add(chat_id)
-        await update.message.reply_text("⚠️ Бот на техобслуживании, попробуйте позже.")
-        return
+def remove_task(uid, task_id):
+    if task_id in TASKS and TASKS[task_id]["uid"] == uid:
+        del TASKS[task_id]
+        return True
+    return False
 
-    # Простейший парсинг времени (пример: "через 5 минут")
-    if "через" in msg and "минут" in msg:
-        try:
-            n = int(msg.split("через")[1].split("минут")[0].strip())
-            run_at = datetime.now() + timedelta(minutes=n)
-            save_task(uid, chat_id, msg, run_at.isoformat())
-            await update.message.reply_text(f"✅ Напоминание сохранено на {run_at.strftime('%H:%M:%S')}")
-        except:
-            await update.message.reply_text("Не понял время, попробуй еще раз.")
-    else:
-        await update.message.reply_text("Принято ✅")
 async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not context.args:
         await update.message.reply_text("Укажи ID задачи для удаления.")
         return
-        
     task_id = context.args[0]
     removed = remove_task(uid, task_id)
     if removed:
         await update.message.reply_text("✅ Задача удалена.")
     else:
-        await update.message.reply_text("❌ Задача не найдена.")
+        await update.message.reply_text("⚠️ Задача не найдена.")
 
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+# ======= ОБРАБОТКА ТЕКСТА =========
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MAINTENANCE
+    msg = (update.message.text or "").strip()
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
 
-BOT_TOKEN = "ТВОЙ_ТОКЕН"
+    # Проверка доступа
+    if uid not in ALLOWED_USERS:
+        if re.fullmatch(r"VIP\d{3}", msg):
+            if msg in ACCESS_KEYS and ACCESS_KEYS[msg] is None:
+                ACCESS_KEYS[msg] = uid
+                ALLOWED_USERS.add(uid)
+                save_db()
+                await update.message.reply_text("Ключ принят ✅. Теперь можно ставить напоминания.")
+            else:
+                await update.message.reply_text("Ключ недействителен ❌.")
+        else:
+            await update.message.reply_text("Бот приватный.Введите ключ в формате ABC123.")
+        return
 
-# Запуск бота
+    # Техработы
+    if MAINTENANCE and uid != ADMIN_ID:
+        PENDING_CHATS.add(chat_id)
+        await update.message.reply_text("⚠️ Бот на техобслуживании, попробуйте позже.")
+        return
+
+    # Простейший парсинг: "через X минут ..."
+    if "через" in msg and "минут" in msg:
+        try:
+            n = int(msg.split("через")[1].split("минут")[0].strip())
+            run_at = datetime.now(TIMEZONE) + timedelta(minutes=n)
+            tid = save_task(uid, chat_id, msg, run_at.isoformat())
+            await update.message.reply_text(f"✅ Напоминание сохранено на {run_at.strftime('%H:%M')} (ID {tid})")
+        except:
+            await update.message.reply_text("Не понял время, попробуйте ещё раз.")
+        return
+
+    await update.message.reply_text("Принято ✅")
+
+# ======= MAIN =========
 def main():
+    load_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("delete", delete_task))
     app.add_handler(CommandHandler("maintenance_on", maintenance_on))
     app.add_handler(CommandHandler("maintenance_off", maintenance_off))
+    app.add_handler(CommandHandler("delete", delete_task))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # обработка текста
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_key_or_text))
-
-    # запуск в режиме polling (или webhook, если настроен)
     app.run_polling()
 
 if __name__ == "__main__":
