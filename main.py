@@ -247,7 +247,8 @@ async def cmd_affairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_affairs_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.idif uid not in ALLOWED_USERS:
+    uid = update.effective_user.id
+    if uid not in ALLOWED_USERS:
         await update.message.reply_text(PRIVATE_PROMPT)
         return
     if not context.args:
