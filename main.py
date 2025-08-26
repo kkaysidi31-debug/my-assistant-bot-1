@@ -521,5 +521,7 @@ def main():
     log.info("Starting bot with polling...")
     app.run_polling(close_loop=False)
 
+import asyncio
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
