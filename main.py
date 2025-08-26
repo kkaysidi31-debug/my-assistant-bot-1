@@ -344,4 +344,11 @@ async def main():
     await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import asyncio
+
+    try:
+        asyncio.run(main())
+    except RuntimeError:  # если цикл уже запущен
+        loop = asyncio.get_event_loop()
+        loop.create_task(main())
+        loop.run_forever()
