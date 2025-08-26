@@ -124,11 +124,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не понял время, попробуй еще раз.")
     else:
         await update.message.reply_text("Принято ✅")
-        async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not context.args:
         await update.message.reply_text("Укажи ID задачи для удаления.")
         return
+        
     task_id = context.args[0]
     removed = remove_task(uid, task_id)
     if removed:
