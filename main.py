@@ -1,232 +1,273 @@
+# main.py
 # -*- coding: utf-8 -*-
-import os
-import re
+
 import json
 import logging
+import os
+import re
 import threading
-from io import BytesIO
 from datetime import datetime, timedelta, time, timezone as dt_timezone
-from zoneinfo import ZoneInfo
-from pathlib import Path
 
-from flask import Flask, Response
-
+import pytz
 from telegram import Update, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes,
-    TypeHandler, ApplicationHandlerStop, filters
+    filters
 )
 
-# =============== ЛОГИ ===============
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("assistant-bot")
+# ------------------------ Конфиг ------------------------
 
-# =============== НАСТРОЙКИ ===============
-TIMEZONE = ZoneInfo("Europe/Kaliningrad")
-PORT = int(os.getenv("PORT", "10000"))
+ADMIN_ID = 963586834  # твой Telegram ID (админ)
+TZ_NAME = "Europe/Kaliningrad"
+TZ = pytz.timezone(TZ_NAME)
 
-# Админ (твой ID)
-ADMIN_IDS = {963586834}
+DATA_FILE = "data.json"
+DATA_LOCK = threading.Lock()
 
-# Файлы-памяти (чтобы после перезапуска не терять ключи/дела/ожидающих)
-DATA_DIR = Path(".")
-KEYS_FILE = DATA_DIR / "access_keys.json"   # { "VIP001": user_id|null, ... }
-TASKS_FILE = DATA_DIR / "tasks.json"        # { str(user_id): [ {kind, text, due_iso|hh:mm, job_name}, ... ] }
-PENDING_FILE = DATA_DIR / "pending_chats.json"  # [ chat_id, ... ]
+# Сгенерированные ключи доступа VIP001..VIP100
+ACCESS_KEYS = {f"VIP{str(i).zfill(3)}": None for i in range(1, 101)}
 
-# Приватные ключи (100 одноразовых)
-def _default_keys() -> dict[str, int | None]:
-    return {f"VIP{n:03d}": None for n in range(1, 101)}
+# ------------------------ Логирование -------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("reminder-bot")
 
-def _load_json(path: Path, default):
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return default() if callable(default) else default
+# ------------------------ Хранилище ---------------------
 
-def _save_json(path: Path, data):
-    try:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        log.warning("Save %s failed: %s", path, e)
+def _load():
+    if not os.path.exists(DATA_FILE):
+        return {
+            "allowed_users": [],
+            "keys": ACCESS_KEYS,
+            "tasks": [],     # будущие задачи
+            "history": [],   # выполненные задачи
+            "maintenance": False,
+            "pending_chats": []  # кому написать, когда техработы закончатся
+        }
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-ACCESS_KEYS: dict[str, int | None] = _load_json(KEYS_FILE, _default_keys)
-ALLOWED_USERS: set[int] = {uid for uid in ACCESS_KEYS.values() if isinstance(uid, int)}
-TASKS: dict[str, list[dict]] = _load_json(TASKS_FILE, dict)
-PENDING_CHATS: set[int] = set(_load_json(PENDING_FILE, list))
+def _save(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def save_keys(): _save_json(KEYS_FILE, ACCESS_KEYS)
-def save_tasks(): _save_json(TASKS_FILE, TASKS)
-def save_pending(): _save_json(PENDING_FILE, list(PENDING_CHATS))
+def db_get():
+    with DATA_LOCK:
+        return _load()
 
-# Режим техработ
-MAINTENANCE = False
+def db_put(mutator):
+    with DATA_LOCK:
+        data = _load()
+        mutator(data)
+        _save(data)
+        return data
 
-# =============== ВСПОМОГАТЕЛЬНЫЕ ===============
-def now_local() -> datetime:
-    return datetime.now(TIMEZONE)
+# --------------------- Утилиты времени ------------------
 
-def fmt_dt(dt: datetime) -> str:
-    return dt.astimezone(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+def now_local():
+    return datetime.now(TZ)
 
-def to_utc(dt_local: datetime) -> datetime:
-    # для run_once в PTB20 можно передать aware-datetime в UTC
+def to_utc(dt_local):
+    """Получить aware-UTC datetime из локального aware-датавремени."""
     return dt_local.astimezone(dt_timezone.utc)
 
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+def fmt_dt_local(dt_local):
+    return dt_local.strftime("%d.%m.%Y %H:%M")
 
-# =============== МЕСЯЦЫ (ru) ===============
+# ------------------------ Доступ ------------------------
+
+def user_allowed(user_id: int) -> bool:
+    data = db_get()
+    return user_id in data["allowed_users"]
+
+async def ask_key(update: Update):
+    await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
+
+async def try_accept_key(update: Update) -> bool:
+    """Пробует принять ключ, если сообщение похоже на ключ. Возвращает True, если ключ принят/уже есть доступ."""
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip().upper()
+
+    if user_allowed(user_id):
+        return True
+
+    if not re.fullmatch(r"[A-Z]{3}\d{3}", text):
+        return False
+
+    def mutate(d):
+        # ключ валиден и свободен?
+        if text in d["keys"] and (d["keys"][text] is None or d["keys"][text] == user_id):
+            d["keys"][text] = user_id
+            if user_id not in d["allowed_users"]:
+                d["allowed_users"].append(user_id)
+
+    db_put(mutate)
+    if user_allowed(user_id):
+        await update.message.reply_text("Ключ принят ✅. Теперь можно ставить напоминания.")
+        return True
+    return False
+
+# ------------------------ Техработы ----------------------
+
+async def maintenance_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    def mutate(d):
+        d["maintenance"] = True
+    db_put(mutate)
+    await update.message.reply_text("🟡 Технические работы включены.")
+
+async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    data = db_put(lambda d: d.update({"maintenance": False}))
+    # Оповестить тех, кто писал во время простоя
+    pending = data.get("pending_chats", [])
+    if pending:
+        # Очистим список и сообщим
+        def clear_mut(d):
+            d["pending_chats"] = []
+        db_put(clear_mut)
+        for chat_id in set(pending):
+            try:
+                await context.bot.send_message(chat_id=chat_id, text="✅ Бот снова работает.")
+            except Exception as e:log.warning(f"notify back failed for {chat_id}: {e}")
+    await update.message.reply_text("🟢 Технические работы отключены.")
+
+# ------------------------ Парсер RU ----------------------
+
 MONTHS = {
-    "января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,
-    "июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12,
-    "январь":1,"февраль":2,"март":3,"апрель":4,"май":5,"июнь":6,"июль":7,
-    "август":8,"сентябрь":9,"октябрь":10,"ноябрь":11,"декабрь":12,
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
 }
 
-RE_TIME = r"(?P<h>\d{1,2})[:.](?P<m>\d{2})"
+RE_TIME = r"(?P<h>\d{1,2}):(?P<m>\d{2})"
 
-# =============== ПАРСЕР ТЕКСТА ===============
-def parse_user_text(t: str):
+def parse_request_ru(text: str):
     """
-    Возвращает один из dict:
-      {"after": timedelta, "text": "..."}
-      {"once_at": datetime (aware local), "text": "..."}
-      {"daily_at": time (aware local), "text": "..."}
-      или None (если формат не распознан)
+    Возвращает один из словарей:
+    {"after": timedelta, "text": "..."}
+    {"once_at": datetime_local, "text": "..."}
+    {"daily_at": time_local, "text": "..."}
     """
-    s = t.strip().lower().replace("ё", "е")
+    t = text.strip().lower()
 
-    # через N минут/часов …
-    m = re.match(r"^через\s+(\d{1,3})\s*(минут(?:ы)?|мин|час(?:а|ов)?)\s+(.+)$", s)
+    # 1) через N минут/часов <текст>
+    m = re.match(r"^через\s+(?P<n>\d+)\s*(?P<u>минут[уы]?|час[аов]?)\s+(?P<txt>.+)$", t)
     if m:
-        n = int(m.group(1))
-        unit = m.group(2)
-        delta = timedelta(minutes=n) if unit.startswith("мин") else timedelta(hours=n)
-        return {"after": delta, "text": m.group(3).strip()}
+        n = int(m.group("n"))
+        unit = m.group("u")
+        txt = m.group("txt").strip()
+        delta = timedelta(minutes=n) if unit.startswith("минут") else timedelta(hours=n)
+        return {"after": delta, "text": txt}
 
-    # сегодня в HH:MM …
-    m = re.match(rf"^сегодня\s+в\s+{RE_TIME}\s+(.+)$", s)
+    # 2) сегодня в HH:MM <текст>
+    m = re.match(rf"^сегодня\s+в\s+{RE_TIME}\s+(?P<txt>.+)$", t)
     if m:
         hh, mm = int(m.group("h")), int(m.group("m"))
+        txt = m.group("txt").strip()
         dt = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if dt <= now_local():
+        # если время уже прошло, двигаем на завтра
+        if dt < now_local():
             dt += timedelta(days=1)
-        return {"once_at": dt, "text": m.group(3) if m.lastindex and m.lastindex >= 3 else s}
+        return {"once_at": dt, "text": txt}
 
-    # завтра в HH:MM …
-    m = re.match(rf"^завтра\s+в\s+{RE_TIME}\s+(.+)$", s)
+    # 3) завтра в HH:MM <текст>
+    m = re.match(rf"^завтра\s+в\s+{RE_TIME}\s+(?P<txt>.+)$", t)
     if m:
         hh, mm = int(m.group("h")), int(m.group("m"))
-        dt = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0) + timedelta(days=1)
-        return {"once_at": dt, "text": m.group(3) if m.lastindex and m.lastindex >= 3 else s}
+        txt = m.group("txt").strip()
+        base = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
+        dt = base + timedelta(days=1)
+        return {"once_at": dt, "text": txt}
 
-    # каждый день в HH:MM …
-    m = re.match(rf"^каждый\s+день\s+в\s+{RE_TIME}\s*(.*)$", s)
+    # 4) каждый день в HH:MM <текст>
+    m = re.match(rf"^каждый\s+день\s+в\s+{RE_TIME}\s+(?P<txt>.+)$", t)
     if m:
         hh, mm = int(m.group("h")), int(m.group("m"))
-        text = (m.group(3) or "").strip() or "Ежедневное напоминание"
-        return {"daily_at": time(hh, mm, tzinfo=TIMEZONE), "text": text}
+        txt = m.group("txt").strip()
+        return {"daily_at": time(hour=hh, minute=mm, tzinfo=TZ), "text": txt}
 
-    # короткий вариант: "в HH:MM ..."
-    m = re.match(rf"^в\s+{RE_TIME}\s+(.+)$", s)
+    # 5) DD <месяц> [в HH:MM] <текст>
+    m = re.match(
+        rf"^(?P<d>\d{{1,2}})\s+(?P<mon>{'|'.join(MONTHS.keys())})(?:\s+в\s+{RE_TIME})?\s+(?P<txt>.+)$",
+        t
+    )
     if m:
-        hh, mm = int(m.group("h")), int(m.group("m"))
-        dt = now_local().replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if dt <= now_local():
-            dt += timedelta(days=1)
-        return {"once_at": dt, "text": m.group(3)}
-
-    # DD <месяц> [в HH:MM] ...
-    m = re.match(rf"^(?P<d>\d{{1,2}})\s+(?P<mon>[а-я]+)(?:\s+в\s+{RE_TIME})?\s+(?P<txt>.+)$", s)
-    if m:
-        day = int(m.group("d"))
-        mon_name = m.group("mon")
-        mon = MONTHS.get(mon_name)
-        if mon:
-            hh = int(m.group("h")) if m.group("h") else 9
-            mm = int(m.group("m")) if m.group("m") else 0
-            dt = datetime(now_local().year, mon, day, hh, mm, tzinfo=TIMEZONE)
-            if dt <= now_local():
-                dt = datetime(now_local().year + 1, mon, day, hh, mm, tzinfo=TIMEZONE)
-            return {"once_at": dt, "text": m.group("txt").strip()}
+        d = int(m.group("d"))
+        mon = MONTHS[m.group("mon")]
+        txt = (m.group("txt") or "").strip()
+        hh = int(m.group("h")) if m.group("h") else 9
+        mm = int(m.group("m")) if m.group("m") else 0
+        year = now_local().year
+        dt = datetime(year, mon, d, hh, mm, tzinfo=TZ)
+        # Если дата уже прошла в этом году, переносим на следующий
+        if dt < now_local():
+            dt = datetime(year + 1, mon, d, hh, mm, tzinfo=TZ)
+        return {"once_at": dt, "text": txt}
 
     return None
 
-# =============== ХРАНЕНИЕ ДЕЛ ===============
-def list_tasks(uid: int) -> list[dict]:
-    return TASKS.get(str(uid), [])
+# --------------------- Планировщик задач ----------------
 
-def add_task(uid: int, task: dict):
-    lst = TASKS.get(str(uid), [])
-    lst.append(task)
-    # сортируем по due_iso (однократные) и по времени (ежедневные)
-    def _key(x):
-        return (0, x.get("due_iso", "9999-12-31T23:59:59")) if x["kind"] == "once" else (1, x.get("time","99:99"))
-    lst.sort(key=_key)
-    TASKS[str(uid)] = lst
-    save_tasks()
+def add_task(chat_id: int, when_dt_local: datetime | None, text: str, kind: str, job_name: str):
+    """
+    Сохранить задачу в БД.
+    kind: "once" или "daily"
+    when_dt_local: для once — aware локальный datetime; для daily — None (в tasks кладём HH:MM отдельно)
+    """
+    def mutate(d):
+        if kind == "once":
+            d["tasks"].append({
+                "id": job_name,
+                "chat_id": chat_id,
+                "type": "once",
+                "when": when_dt_local.isoformat(),
+                "text": text
+            })
+        elif kind == "daily":
+            d["tasks"].append({
+                "id": job_name,
+                "chat_id": chat_id,
+                "type": "daily",
+                "hhmm": when_dt_local.strftime("%H:%M"),
+                "text": text
+            })
+    db_put(mutate)
 
-def remove_task_by_index(uid: int, idx: int) -> dict | None:
-    lst = TASKS.get(str(uid), [])
-    if 1 <= idx <= len(lst):
-        item = lst.pop(idx - 1)
-        TASKS[str(uid)] = lst
-        save_tasks()
-        return item
-    return None
+def remove_task(job_name: str):
+    def mutate(d):
+        d["tasks"] = [t for t in d["tasks"] if t["id"] != job_name]
+    db_put(mutate)
 
-# =============== ГОЛОС (опционально) ===============
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-openai_client = None
-if OPENAI_API_KEY:
-    try:
-        from openai import OpenAI
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        log.info("OpenAI client ready (voice -> text)")
-    except Exception as e:
-        log.warning("OpenAI init failed: %s", e)
-        openai_client = None
+def push_history(chat_id: int, planned_local_iso: str, text: str):
+    def mutate(d):
+        d["history"].append({
+            "chat_id": chat_id,
+            "planned_for": planned_local_iso,
+            "text": text,"done_at": now_local().isoformat()
+        })
+    db_put(mutate)
 
-async def transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
-    if not openai_client:
-        await update.message.reply_text("Распознавание голоса недоступно (нет OPENAI_API_KEY).")
-        return None
-    try:
-        f = await context.bot.get_file(update.message.voice.file_id)
-        mem = BytesIO()
-        await f.download_to_memory(out=mem)
-        mem.seek(0)
-        # можно "whisper-1" или "gpt-4o-mini-transcribe"
-        res = openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=("audio.ogg", mem, "audio/ogg"),
-            response_format="text",
-            language="ru"
-        )
-        text = (res or "").strip()
-        return text if text else None
-    except Exception as e:
-        log.exception("Transcribe error: %s", e)
-        await update.message.reply_text("Не удалось распознать голос.")
-        return None
+# ---------------------- Джоб-коллбеки -------------------
 
-# =============== JOB CALLBACK ===============
-async def remind_callback(context: ContextTypes.DEFAULT_TYPE):
+async def remind_job(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
-    data = job.data or {}
-    cid = data.get("chat_id")
-    txt = data.get("text", "Напоминание")
-    try:
-        await context.bot.send_message(cid, f"⏰ {txt}")
-    except Exception as e:
-        log.warning("send msg failed: %s", e)
+    payload = job.data or {}
+    chat_id = payload.get("chat_id")
+    text = payload.get("text")
+    planned_local_iso = payload.get("planned_local_iso")  # строкой
 
-# =============== КОМАНДЫ ===============
-HELP_TEXT = (
-    "Бот запущен ✅\n\n"
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    finally:
+        # Переносим в историю и удаляем из активных
+        if planned_local_iso and chat_id is not None and text:
+            push_history(chat_id, planned_local_iso, text)
+        remove_task(job.name)
+
+# ------------------------ Хэндлеры ----------------------
+
+HELP_EXAMPLES = (
     "Примеры:\n"
     "• сегодня в 16:00 купить молоко\n"
     "• завтра в 9:15 встреча с Андреем\n"
@@ -234,230 +275,251 @@ HELP_TEXT = (
     "• через 5 минут попить воды\n"
     "• каждый день в 09:30 зарядка\n"
     "• 30 августа в 09:00 заплатить за кредит\n"
-    "• Напоминание за какое либо кол-во времени пишите так(Пример напоминания за 1 час): Сегодня в 14:00(Сигнал для бота - в какое время уведомить) напоминаю, встреча в 15:00(Это само напоминание которое бот отправит вам в указанное время - в данном случае в 14:00) Так можно делать с любой датой\n"
+    "• Напоминание за какое либо кол-во времени пишите так (пример на 1 час):\n"
+    "  Сегодня в 14:00 напомни, встреча в 15:00\n"
     "(часовой пояс: Europe/Kaliningrad)"
 )
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in ALLOWED_USERS:
-        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
+    if not user_allowed(uid):
+        await ask_key(update)
         return
-    # Поставим меню команд (один раз на пользователя — ок)
-    try:
-        await context.bot.set_my_commands([
-            BotCommand("start", "Помощь и примеры"),
-            BotCommand("affairs", "Список дел"),
-            BotCommand("affairs_delete", "Удалить дело по номеру"),
-            BotCommand("maintenance_on", "🔧 (админ) Включить техработы"),
-            BotCommand("maintenance_off", "🔧 (админ) Выключить техработы"),
-        ])
-    except Exception:
-        pass
-    await update.message.reply_text(HELP_TEXT)
 
-async def cmd_affairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Бот запущен ✅\n\n" + HELP_EXAMPLES)
+
+async def list_affairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in ALLOWED_USERS:
-        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
+    if not user_allowed(uid):
+        if await try_accept_key(update):
+            await start(update, context)
+        else:
+            await ask_key(update)
         return
-    items = list_tasks(uid)
+
+    data = db_get()
+    tasks = [t for t in data["tasks"] if t["chat_id"] == uid]
+
+    # Сформируем человекочитаемое + сохраним карту индексов в память контекста
+    items = []
+    index_map = []
+    for t in sorted(tasks, key=lambda x: x["when"] if x["type"] == "once" else x.get("hhmm", "")):
+        if t["type"] == "once":
+            dt_loc = datetime.fromisoformat(t["when"])
+            items.append(f"{fmt_dt_local(dt_loc)} — {t['text']}")
+        else:
+            items.append(f"ежедневно в {t['hhmm']} — {t['text']}")
+        index_map.append(t["id"])
+
     if not items:
-        await update.message.reply_text("Список пуст.")
+        await update.message.reply_text("Список дел пуст.")
         return
-    lines = ["Ваши ближайшие дела:"]
-    for i, it in enumerate(items, 1):
-        if it["kind"] == "once":
-            dt = datetime.fromisoformat(it["due_iso"]).astimezone(TIMEZONE)
-            lines.append(f"{i}. {fmt_dt(dt)} — {it['text']}")
-        else:
-            lines.append(f"{i}. {it['time']} — {it['text']} (ежедневно)")
-    await update.message.reply_text("\n".join(lines))
 
-async def cmd_affairs_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # запомним отображение индексов для удаления
+    context.user_data["index_map"] = index_map
+    pretty = "Ваши ближайшие дела:\n" + "\n".join(f"{i+1}. {it}" for i, it in enumerate(items))
+    await update.message.reply_text(pretty)
+
+async def delete_affair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in ALLOWED_USERS:
-        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Использование: /affairs_delete N")
-        return
-    n = int(context.args[0])
-    items = list_tasks(uid)
-    if not (1 <= n <= len(items)):
-        await update.message.reply_text("Нет такого номера.")
-        return
-    # Попробуем снять job (если имя сохранили)
-    job_name = items[n-1].get("job_name")
-    if job_name:
-        for j in context.application.job_queue.get_jobs_by_name(job_name):
-            j.schedule_removal()
-    removed = remove_task_by_index(uid, n)
-    if removed:
-        if removed["kind"] == "once":
-            await update.message.reply_text(f"🗑 Удалено: {fmt_dt(datetime.fromisoformat(removed['due_iso']))} — {removed['text']}")
+    if not user_allowed(uid):
+        if await try_accept_key(update):
+            await start(update, context)
         else:
-            await update.message.reply_text(f"🗑 Удалено: каждый день {removed['time']} — {removed['text']}")
-    else:
-        await update.message.reply_text("Не удалось удалить (возможно, уже выполнено).")
+            await ask_key(update)
+        return
 
-# Техработы
-async def maintenance_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MAINTENANCE
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⚠️ Только администратор может включать техработы.")
+    if not context.args:
+        await update.message.reply_text("Укажите номер дела: /affairs_delete N")
         return
-    MAINTENANCE = True
-    PENDING_CHATS.clear(); save_pending()
-    await update.message.reply_text("🟡 Технические работы включены. Бот временно не принимает задачи.")
-
-async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MAINTENANCE
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⚠️ Только администратор может выключать техработы.")
-        return
-    MAINTENANCE = False
-    await update.message.reply_text("✅ Технические работы завершены. Рассылаю уведомления…")
-    to_notify = list(PENDING_CHATS)
-    PENDING_CHATS.clear(); save_pending()
-    for cid in to_notify:
-        try:
-            await context.bot.send_message(cid, "✅ Бот снова работает.")
-        except Exception:
-            pass
-
-# =============== ОБРАБОТЧИКИ СООБЩЕНИЙ ===============
-async def maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Глобальный шлагбаум: во время техработ пропускаем только админа и команды техработ."""
-    if not MAINTENANCE:
-        return
-    uid = update.effective_user.id if update.effective_user else None
-    # Админу даём проход
-    if uid in ADMIN_IDS:
-        return
-    # Остальным: жёлтое предупреждение и запомнить чат
-    cid = update.effective_chat.id if update.effective_chat else None
-    if cid and cid not in PENDING_CHATS:
-        PENDING_CHATS.add(cid); save_pending()
-    # Ответить только на текст/голос (чтобы не спамить на каждое обновление)
     try:
-        if update.message:
-            await context.bot.send_message(cid,
-                "🟡 Уважаемый пользователь! Сейчас ведутся технические работы. "
-                "Как только бот снова заработает, мы сообщим вам."
-            )
+        n = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Номер должен быть числом.")
+        return
+
+    index_map = context.user_data.get("index_map")
+    if not index_map:
+        await update.message.reply_text("Сначала выполните /affairs, чтобы увидеть нумерацию.")
+        return
+    if not (1 <= n <= len(index_map)):
+        await update.message.reply_text("Неверный номер.")
+        return
+
+    job_name = index_map[n-1]
+    # удаляем из БД
+    def mutate(d):
+        d["tasks"] = [t for t in d["tasks"] if t["id"] != job_name]
+    db_put(mutate)
+
+    # отменяем джоб, если есть
+    try:
+        context.job_queue.get_jobs_by_name(job_name)
+        for j in context.job_queue.get_jobs_by_name(job_name):
+            j.schedule_removal()
     except Exception:
         pass
-    raise ApplicationHandlerStop
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Удалено.")
+
+async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    text = (update.message.text or "").strip()
-
-    # Приватный доступ: принимаем ключ в формате ABC123, но реальные — VIPxxx
-    if uid not in ALLOWED_USERS:
-        candidate = text.upper()
-        if re.fullmatch(r"[A-Z]{3}\d{3}", candidate) and candidate in ACCESS_KEYS and ACCESS_KEYS[candidate] is None:
-            ACCESS_KEYS[candidate] = uid
-            ALLOWED_USERS.add(uid)
-            save_keys()
-            await update.message.reply_text("Ключ принят ✅. Теперь можно ставить напоминания.\n\n" + HELP_TEXT)
-            return
-        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
+    if not user_allowed(uid):
+        if await try_accept_key(update):
+            await start(update, context)
+        else:
+            await ask_key(update)
         return
 
-    parsed = parse_user_text(text)
+    data = db_get()
+    items = [h for h in data["history"] if h["chat_id"] == uid]
+    if not items:
+        await update.message.reply_text("История пуста.")
+        return
+    # последние 20
+    items = items[-20:]
+    lines = []
+    for h in items:
+        dt_planned = datetime.fromisoformat(h["planned_for"])
+        done_at = datetime.fromisoformat(h["done_at"])
+        lines.append(f"{fmt_dt_local(dt_planned)} — {h['text']} (выполнено: {fmt_dt_local(done_at)})")
+    await update.message.reply_text("История последних дел:\n" + "\n".join(lines))
+
+# основной обработчик текста (постановка напоминаний)
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text:
+        return
+
+    user_id = update.effective_user.id
+    data = db_get()
+
+    # Техработы
+    if data.get("maintenance") and user_id != ADMIN_ID:
+        # запомним, чтобы уведомить позже
+        def mutate(d):
+            d["pending_chats"].append(update.effective_chat.id)
+        db_put(mutate)
+        await msg.reply_text("🟡 Уважаемый пользователь, проводятся технические работы. Как только бот снова заработает — оповестим вас.")
+        return
+
+    # Приватный доступ
+    if not user_allowed(user_id):
+        if await try_accept_key(update):
+            await start(update, context)
+        else:
+            await ask_key(update)
+        return
+
+    parsed = parse_request_ru(msg.text)
     if not parsed:
-        await update.message.reply_text(
-            "❓ Не понял формат. Примеры:\n"
-            "— сегодня в 16:00 купить молоко\n"
-            "— завтра в 9:15 встреча\n"
-            "— в 22:30 позвонить маме\n"
-            "— через 5 минут попить воды\n"
-            "— каждый день в 09:30 зарядка\n"
-            "— 30 августа в 09:00 заплатить за кредит"
+        await msg.reply_text(
+            "❓ Не понял формат. Используй:\n"
+            "— через N минут/часов ...\n"
+            "— сегодня в HH:MM ...\n"
+            "— завтра в HH:MM ...\n"
+            "— каждый день в HH:MM ...\n"
+            "— DD <месяц> [в HH:MM] ..."
         )
         return
 
+    # Планирование
+    q = context.job_queue
     chat_id = update.effective_chat.id
 
-    # 1) через N …
+    # разовые через delta
     if "after" in parsed:
-        delta: timedelta = parsed["after"]
-        job = context.application.job_queue.run_once(
-            remind_callback, when=delta, chat_id=chat_id, data={"chat_id": chat_id, "text": parsed["text"]}
+        run_at_local = now_local() + parsed["after"]
+        job_name = f"once_{user_id}_{int(datetime.now().timestamp())}"
+        q.run_once(
+            remind_job,
+            when=to_utc(run_at_local),              # datetime aware (UTC)
+            name=job_name,
+            data={"chat_id": chat_id, "text": parsed["text"], "planned_local_iso": run_at_local.isoformat()},
         )
-        due = now_local() + delta
-        add_task(uid, {"kind":"once","text":parsed["text"],"due_iso":due.isoformat(), "job_name": job.name})
-        await update.message.reply_text(f"✅ Отлично, напомню {fmt_dt(due)} — «{parsed['text']}».")
+        add_task(chat_id, run_at_local, parsed["text"], "once", job_name)
+        await msg.reply_text(f"✅ Ок, напомню через {parsed['after']} — «{parsed['text']}».")
         return
 
-    # 2) один раз в момент
+    # разовые к конкретному моменту
     if "once_at" in parsed:
-        local_dt: datetime = parsed["once_at"]
-        job = context.application.job_queue.run_once(
-            remind_callback, when=to_utc(local_dt), chat_id=chat_id, data={"chat_id": chat_id, "text": parsed["text"]}
+        run_at_local = parsed["once_at"]
+        job_name = f"once_{user_id}_{int(datetime.now().timestamp())}"
+        q.run_once(
+            remind_job,
+            when=to_utc(run_at_local),
+            name=job_name,
+            data={"chat_id": chat_id, "text": parsed["text"], "planned_local_iso": run_at_local.isoformat()},
         )
-        add_task(uid, {"kind":"once","text":parsed["text"],"due_iso":local_dt.isoformat(), "job_name": job.name})
-        await update.message.reply_text(f"✅ Отлично, напомню {fmt_dt(local_dt)} — «{parsed['text']}».")
+        add_task(chat_id, run_at_local, parsed["text"], "once", job_name)
+        await msg.reply_text(f"✅ Ок, напомню {fmt_dt_local(run_at_local)} — «{parsed['text']}». (TZ: {TZ_NAME})")
         return
 
-    # 3) каждый день в HH:MM
+    # ежедневные
     if "daily_at" in parsed:
-        tm: time = parsed["daily_at"]  # с tzinfo=TIMEZONE
-        job = context.application.job_queue.run_daily(
-            remind_callback, time=tm, chat_id=chat_id, data={"chat_id": chat_id, "text": parsed["text"]}
+        t_local: time = parsed["daily_at"]
+        hhmm = time(hour=t_local.hour, minute=t_local.minute, tzinfo=TZ)
+        job_name = f"daily_{user_id}_{int(datetime.now().timestamp())}"
+
+        # ближайший запуск (сегодня/завтра), затем — раз в сутки
+        first = now_local().replace(hour=hhmm.hour, minute=hhmm.minute, second=0, microsecond=0)
+        if first <= now_local():
+            first += timedelta(days=1)
+
+        async def daily_wrapper(ctx: ContextTypes.DEFAULT_TYPE):
+            await remind_job(ctx)
+
+        q.run_repeating(
+            daily_wrapper,
+            interval=timedelta(days=1),
+            first=to_utc(first),
+            name=job_name,
+            data={"chat_id": chat_id, "text": parsed["text"], "planned_local_iso": first.isoformat()},
         )
-        add_task(uid, {"kind":"daily","text":parsed["text"],"time":tm.strftime("%H:%M"), "job_name": job.name})
-        await update.message.reply_text(f"✅ Отлично, буду напоминать каждый день в {tm.strftime('%H:%M')} — «{parsed['text']}».")
+        add_task(chat_id, first, parsed["text"], "daily", job_name)
+        await msg.reply_text(f"✅ Ок, буду напоминать каждый день в {hhmm.strftime('%H:%M')} — «{parsed['text']}».")
         return
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Пропускаем через распознавание и дальше — как текст
-    txt = await transcribe_voice(update, context)
-    if not txt:
-        return
-    update.message.text = txt
-    await handle_text(update, context)
+# ------------------------ Команды -----------------------
 
-# =============== Мини-HTTP (Flask) для Render/UptimeRobot ===============
-def run_flask():
-    app = Flask(__name__)
+async def set_commands(app: Application):
+    await app.bot.set_my_commands([
+        BotCommand("start", "Помощь и примеры"),
+        BotCommand("affairs", "Список дел"),
+        BotCommand("affairs_delete", "Удалить дело по номеру"),
+        BotCommand("history", "История выполненных дел"),
+        BotCommand("maintenance_on", "Техработы: вкл (админ)"),
+        BotCommand("maintenance_off", "Техработы: выкл (админ)"),
+    ])
 
-    @app.get("/")
-    def root():
-        return Response("✅ Bot is running", mimetype="text/plain", status=200)
+# ------------------------ Запуск ------------------------
 
-    app.run(host="0.0.0.0", port=PORT, debug=False)
-
-# =============== MAIN ===============
 def main():
-    token = os.getenv("BOT_TOKEN")
-    if not token:
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    if not BOT_TOKEN:
         raise SystemExit("Нет переменной окружения BOT_TOKEN")
 
-    # поднимем HTTP в фоне
-    threading.Thread(target=run_flask, daemon=True).start()
+    # убедимся, что файл БД и ключи существуют
+    db_put(lambda d: d)  # lazy init
 
-    application = Application.builder().token(token).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # Глобальный «шлагбаум» техработ — раньше всех
-    application.add_handler(TypeHandler(Update, maintenance_guard), group=-100)
+    # команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("affairs", list_affairs))
+    app.add_handler(CommandHandler("affairs_delete", delete_affair))
+    app.add_handler(CommandHandler("history", show_history))
+    app.add_handler(CommandHandler("maintenance_on", maintenance_on))
+    app.add_handler(CommandHandler("maintenance_off", maintenance_off))
 
-    # Команды
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("affairs", cmd_affairs))
-    application.add_handler(CommandHandler("affairs_delete", cmd_affairs_delete))
-    application.add_handler(CommandHandler("maintenance_on", maintenance_on))
-    application.add_handler(CommandHandler("maintenance_off", maintenance_off))
+    # текст
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Голосовые
-    application.add_handler(MessageHandler(filters.VOICE & ~filters.COMMAND, handle_voice))
-    # Текст
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # меню команд
+    app.post_init = lambda _: app.create_task(set_commands(app))
 
-    log.info("Starting bot with polling …")
-    application.run_polling(close_loop=False)
+    log.info("Starting bot with polling...")
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
