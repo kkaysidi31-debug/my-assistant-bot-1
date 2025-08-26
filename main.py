@@ -227,18 +227,21 @@ async def affairs_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def maintenance_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid != ADMIN_ID: 
-        return global MAINTENANCE
-    MAINTENANCE = True
-    await update.message.reply_text("🟡 Технические работы включены.")
+   # maintenance_on
+if uid != ADMIN_ID:
+    return
+global MAINTENANCE
+MAINTENANCE = True
+await update.message.reply_text("🟡 Технические работы включены.")
 
 async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid != ADMIN_ID:
-        return
-    global MAINTENANCE
-    MAINTENANCE = False
-    await update.message.reply_text("🟢 Технические работы выключены.")
+    # maintenance_off
+if uid != ADMIN_ID:
+    return
+global MAINTENANCE
+MAINTENANCE = False
+await update.message.reply_text("🟢 Технические работы выключены.")
     # уведомим ожидавших
     while PENDING_CHATS:
         cid = PENDING_CHATS.pop()
