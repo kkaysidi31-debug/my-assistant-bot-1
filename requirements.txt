@@ -1,2 +1,2 @@
-python-telegram-bot==20.3
-pytz==2023.3
+python-telegram-bot[job-queue]>=21,<22
+pytz
