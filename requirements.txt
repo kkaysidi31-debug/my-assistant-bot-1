@@ -1,2 +1,4 @@
-python-telegram-bot[job-queue]>=21,<22
-pytz
+python-telegram-bot==20.6
+Flask==2.3.3
+pytz==2023.3
+openai==1.3.7
