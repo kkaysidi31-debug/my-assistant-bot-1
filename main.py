@@ -210,33 +210,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_key_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global MAINTENANCE
+
     msg = (update.message.text or "").strip()
     uid = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    # 1) Если не авторизован — пытаемся принять ключ
+    # 1) Если НЕ авторизован — пробуем принять ключ
     if uid not in ALLOWED_USERS:
         if re.fullmatch(r'VIP\d{3}', msg):
+            # ключ формально верный по формату, проверяем в пуле
             if msg in ACCESS_KEYS and ACCESS_KEYS[msg] is None:
                 ACCESS_KEYS[msg] = uid
                 ALLOWED_USERS.add(uid)
                 save_db()
-                await update.message.reply_text("Ключ принят ✅. Теперь можно ставить напоминания.\n\n" + examples_text())
-
-        else:
-                await update.message.reply_text("Ключ недействителен или уже использован.")
-        else:
-            await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
+                await update.message.reply_text(
+                    "Ключ принят ✅. Теперь можно ставить напоминания."
+                )
+            else:
+                await update.message.reply_text("Ключ недействителен ❌.")
+            return
+        # ключ не прислали — просим ввести
+        await update.message.reply_text("Бот приватный. Введите ключ доступа в формате ABC123.")
         return
 
-    # 2) Техработы
+    # 2) Техработы (пускаем только админа)
     if MAINTENANCE and uid != ADMIN_ID:
         PENDING_CHATS.add(chat_id)
-        await update.message.reply_text("⚠️ Уважаемый пользователь! В данный момент ведутся технические работы. Как только бот снова заработает, мы уведомим вас.")
+        await update.message.reply_text(
+            "⚠️ Уважаемый пользователь, в данный момент ведутся технические работы.\n"
+            "Как только бот снова заработает, мы вам сообщим."
+        )
         return
 
-    # 3) Парсинг естественного языка
-    parsed = parse_command(msg)
+    # 3) Парсинг естественного языка и постановка напоминаний
+    await handle_text(update, context)
     if not parsed:
         await update.message.reply_text(
             "❓ Не понял формат. Используй:\n"
