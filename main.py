@@ -243,7 +243,7 @@ async def handle_key_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     # 3) Парсинг естественного языка и постановка напоминаний
-    await handle_text(update, context)
+    await handle_key_or_text(update, context)
     if not parsed:
         await update.message.reply_text(
             "❓ Не понял формат. Используй:\n"
