@@ -323,8 +323,7 @@ async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for cid in to_notify:
         try:
             await context.bot.send_message(cid, "✅ Бот снова работает.")
-
- except Exception:
+        except Exception:
             pass
 
 # =============== ОБРАБОТЧИКИ СООБЩЕНИЙ ===============
