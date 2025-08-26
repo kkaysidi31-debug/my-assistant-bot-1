@@ -136,7 +136,7 @@ async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chat_id in list(PENDING_CHATS):
         try:
             await context.bot.send_message(chat_id, "✅ Бот снова работает.")
-            except Exception as e:
+        except Exception as e:
             log.warning("Notify back error: %s", e)
     PENDING_CHATS.clear()
 
