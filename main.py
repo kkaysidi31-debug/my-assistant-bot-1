@@ -305,19 +305,19 @@ async def handle_key_or_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if "after" in parsed:
         when_dt = now_local() + parsed["after"]
         schedule_once(context.application, chat_id, when_dt, task_text)
-        await update.message.reply_text(f"✅ Ок, напомню через {parsed['after']} — «{task_text}».")
+        await update.message.reply_text(f"✅ Отлично, напомню через {parsed['after']} — «{task_text}».")
     elif "once_at" in parsed:
         when_dt = parsed["once_at"]
         schedule_once(context.application, chat_id, when_dt, task_text)
         await update.message.reply_text(
-            f"✅ Ок, напомню {when_dt.strftime('%Y-%m-%d %H:%M')} — «{task_text}». "
+            f"✅ Отлично, напомню {when_dt.strftime('%Y-%m-%d %H:%M')} — «{task_text}». "
             f"(TZ: Europe/Kaliningrad)"
         )
     elif "daily_at" in parsed:
         at_time = parsed["daily_at"]
         schedule_daily(context.application, chat_id, at_time, task_text)
         await update.message.reply_text(
-            f"✅ Ок, буду напоминать каждый день в {at_time.strftime('%H:%M')} — «{task_text}»."
+            f"✅ Отлично, буду напоминать каждый день в {at_time.strftime('%H:%M')} — «{task_text}»."
         )
 
 async def affairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
