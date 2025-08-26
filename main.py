@@ -137,28 +137,25 @@ async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Задача не найдена.")
 
-# === Flask + Webhook ===
-flask_app = Flask(__name__)
-telegram_app = Application.builder().token(BOT_TOKEN).build()
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CommandHandler("maintenance_on", maintenance_on))
-telegram_app.add_handler(CommandHandler("maintenance_off", maintenance_off))
-telegram_app.add_handler(CommandHandler("delete", delete_task))
-telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+BOT_TOKEN = "ТВОЙ_ТОКЕН"
 
-@flask_app.route("/webhook", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    telegram_app.update_queue.put_nowait(update)
-    return "ok", 200
+# Запуск бота
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("delete", delete_task))
+    app.add_handler(CommandHandler("maintenance_on", maintenance_on))
+    app.add_handler(CommandHandler("maintenance_off", maintenance_off))
+
+    # обработка текста
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_key_or_text))
+
+    # запуск в режиме polling (или webhook, если настроен)
+    app.run_polling()
 
 if __name__ == "__main__":
-    init_db()
-
-    import asyncio
-    async def set_webhook():
-        await telegram_app.bot.set_webhook(WEBHOOK_URL)
-    asyncio.run(set_webhook())
-
-    flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    main()
