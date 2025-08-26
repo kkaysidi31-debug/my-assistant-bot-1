@@ -1,4 +1,2 @@
 python-telegram-bot==20.6
 pytz==2023.3
-aiohttp>=3.9
-openai>=1.30.0
