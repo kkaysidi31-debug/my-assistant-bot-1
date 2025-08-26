@@ -109,93 +109,73 @@ def try_accept_key(user_id: int, text: str) -> bool:
         return True
     return False
 
-# ---------------------- ПАРСИНГ ТЕКСТА ----------------------
-TIME_RE = r"(?P<h>\d{1,2}):(?P<m>\d{2})"
 
-def parse_int(s: str, default: int = 0) -> int:
-    try:
-        return int(s)
-    except Exception:
-        return default
+    # --------- ПАРСИНГ ТЕКСТА (русский) ---------
+import re
+from datetime import datetime, timedelta
+from pytz import timezone
 
-def parse_text_to_schedule(text: str):
-    """
-    Возвращает словарь одной из форм:
-    {"after": timedelta, "text": ...}
-    {"once_at": datetime, "text": ...}
-    {"daily_at": time, "text": ...}
-    """
-    t = (text or "").strip().lower()
+TIMEZONE = timezone("Europe/Kaliningrad")
 
-    # 0) "сегодня в 14:00 ... встреча в 15:00"
-    m = re.search(rf"сегодня\s+в\s+{TIME_RE}.*?встреча\s+в\s+{TIME_RE}", t)
+RE_TIME     = r'(?P<h>\d{1,2}):(?P<m>\d{2})'
+MONTHS_MAP  = {
+    "января":1, "февраля":2, "марта":3, "апреля":4, "мая":5, "июня":6,
+    "июля":7, "августа":8, "сентября":9, "октября":10, "ноября":11, "декабря":12,
+    # поддержим ещё «август»
+    "январь":1, "февраль":2, "март":3, "апрель":4, "июнь":6, "июль":7, "август":8,
+    "сентябрь":9, "октябрь":10, "ноябрь":11, "декабрь":12,
+}
+
+def now_local():
+    return datetime.now(TIMEZONE)
+
+def parse_russian_command(t: str):
+    s = t.strip().lower()
+
+    # 1) «через N минут/часов …»
+    m = re.match(r'^через\s+(?P<n>\d+)\s*(минут|минуты|м|час|часа|часов|ч)\s+(?P<text>.+)$', s)
     if m:
-        h1, m1, h2, m2 = map(parse_int, [m.group("h"), m.group("m"), m.group(3), m.group(4)])
-        remind_at = now_local().replace(hour=h1, minute=m1, second=0, microsecond=0)
-        if remind_at < now_local():
-            remind_at += timedelta(days=1)
-        text_out = re.sub(r".*?встреча\s+в\s+\d{1,2}:\d{2}", "встреча в {:02d}:{:02d}".format(h2, m2), t)
-        return {"once_at": remind_at, "text": text_out}
+        n = int(m.group('n'))
+        unit = m.group(2)
+        delta = timedelta(minutes=n) if unit.startswith(('м','мин')) else timedelta(hours=n)
+        when = now_local() + delta
+        return {"once_at": when, "text": m.group('text').strip()}
 
-    # 1) "через N минут/часов ..."
-    m = re.match(r"через\s+(\d+)\s*(минут|мин|m|mинуты)\b\s*(.+)?", t)
+    # 2) «сегодня в HH:MM …»
+    m = re.match(rf'^сегодня\s+в\s+{RE_TIME}\s+(?P<text>.+)$', s)
     if m:
-        delta = timedelta(minutes=int(m.group(1)))
-        return {"after": delta, "text": (m.group(3) or "").strip()}
-    m = re.match(r"через\s+(\d+)\s*(час|часа|часов|h)\b\s*(.+)?", t)
-    if m:
-        delta = timedelta(hours=int(m.group(1)))
-        return {"after": delta, "text": (m.group(3) or "").strip()}
+        h, mnt = int(m.group('h')), int(m.group('m'))
+        when = now_local().replace(hour=h, minute=mnt, second=0, microsecond=0)
+        return {"once_at": when, "text": m.group('text').strip()}
 
-    # 2) "сегодня в HH:MM ..."
-    m = re.match(rf"сегодня\s+в\s+{TIME_RE}\s*(.+)?", t)
+    # 3) «завтра в HH:MM …»
+    m = re.match(rf'^завтра\s+в\s+{RE_TIME}\s+(?P<text>.+)$', s)
     if m:
-        h, mnt = parse_int(m.group("h")), parse_int(m.group("m"))
-        target = now_local().replace(hour=h, minute=mnt, second=0, microsecond=0)
-        if target < now_local():
-            target += timedelta(days=1)
-        return {"once_at": target, "text": (m.group(3) or "").strip()}
-
-    # 3) "завтра в HH:MM ..."
-    m = re.match(rf"завтра\s+в\s+{TIME_RE}\s*(.+)?", t)
-    if m:
-        h, mnt = parse_int(m.group("h")), parse_int(m.group("m"))
+        h, mnt = int(m.group('h')), int(m.group('m'))
         base = now_local().replace(hour=h, minute=mnt, second=0, microsecond=0)
-        target = base + timedelta(days=1)
-        return {"once_at": target, "text": (m.group(3) or "").strip()}
+        when = base + timedelta(days=1)
+        return {"once_at": when, "text": m.group('text').strip()}
 
-    # 4) "каждый день в HH:MM ..."
-    m = re.match(rf"каждый\s+день\s+в\s+{TIME_RE}\s*(.+)?", t)
+    # 4) «каждый день в HH:MM …»
+    m = re.match(rf'^каждый\s+д(ень|н)\s+в\s+{RE_TIME}\s+(?P<text>.+)$', s)
     if m:
-        h, mnt = parse_int(m.group("h")), parse_int(m.group("m"))
-        return {"daily_at": dtime(hour=h, minute=mnt), "text": (m.group(3) or "").strip()}
+        h, mnt = int(m.group('h')), int(m.group('m'))
+        return {"daily_at": time(h, mnt, tzinfo=TIMEZONE), "text": m.group('text').strip()}
 
-    # 5) "DD <месяц> [в HH:MM] ..."
-    m = re.match(
-        rf"(?P<d>\d{{1,2}})\s+(?P<mon>{'|'.join(MONTHS.keys())})(?:\s+в\s+{TIME_RE})?\s*(?P<text>.+)?",
-        t
-    )
+    # 5) «DD <месяц> [в HH:MM] …»
+    m = re.match(rf'^(?P<dd>\d{{1,2}})\s+(?P<month>[а-я]+)(?:\s+в\s+{RE_TIME})?\s+(?P<text>.+)$', s)
     if m:
-        d = parse_int(m.group("d"))
-        mon = MONTHS[m.group("mon")]
-        year = now_local().year
-        hh = parse_int(m.group("h") or 9)
-        mm = parse_int(m.group("m") or 0)
-        target = TIMEZONE.localize(datetime(year, mon, d, hh, mm, 0))
-        # если дата уже прошла в текущем году — переносим на следующий
-        if target < now_local():
-            target = TIMEZONE.localize(datetime(year + 1, mon, d, hh, mm, 0))
-        return {"once_at": target, "text": (m.group("text") or "").strip()}
+        dd = int(m.group('dd'))
+        month_name = m.group('month')
+        month = MONTHS_MAP.get(month_name)
+        if month:
+            h = int(m.group('h')) if m.groupdict().get('h') else 9
+            mnt = int(m.group('m')) if m.groupdict().get('m') else 0
+            year = now_local().year
+            when = datetime(year, month, dd, h, mnt, tzinfo=TIMEZONE)
+            return {"once_at": when, "text": m.group('text').strip()}
 
-    # 6) "в HH:MM ..." (сегодня ближайшее)
-    m = re.match(rf"в\s+{TIME_RE}\s*(.+)?", t)
-    if m:
-        h, mnt = parse_int(m.group("h")), parse_int(m.group("m"))
-        target = now_local().replace(hour=h, minute=mnt, second=0, microsecond=0)
-        if target < now_local():
-            target += timedelta(days=1)
-        return {"once_at": target, "text": (m.group(3) or "").strip()}
-
+    # Ничего не распознали
     return None
 
 # ---------------------- JOBS ----------------------
