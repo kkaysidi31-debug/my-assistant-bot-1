@@ -226,19 +226,19 @@ async def affairs_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Удалено ✅" if removed else "Не нашёл такую задачу.")
 
 async def maintenance_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-   # maintenance_on
-if uid != ADMIN_ID:
-    return
-global MAINTENANCE
-MAINTENANCE = True
-await update.message.reply_text("🟡 Технические работы включены.")
-
-async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MAINTENANCE   # перенесли наверх
     uid = update.effective_user.id
     if uid != ADMIN_ID:
         return
-    global MAINTENANCE
+    MAINTENANCE = True
+    await update.message.reply_text("🟡 Технические работы включены.")
+
+
+async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MAINTENANCE   # тоже наверх
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        return
     MAINTENANCE = False
     await update.message.reply_text("🟢 Технические работы выключены.")
 
