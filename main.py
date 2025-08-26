@@ -236,20 +236,20 @@ await update.message.reply_text("🟡 Технические работы вкл
 
 async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    # maintenance_off
-if uid != ADMIN_ID:
-    return
-global MAINTENANCE
-MAINTENANCE = False
-await update.message.reply_text("🟢 Технические работы выключены.")
+    if uid != ADMIN_ID:
+        return
+    global MAINTENANCE
+    MAINTENANCE = False
+    await update.message.reply_text("🟢 Технические работы выключены.")
+
     # уведомим ожидавших
     while PENDING_CHATS:
         cid = PENDING_CHATS.pop()
         try:
-            await context.bot.send_message(cid, "✅ Бот снова работает.")
+            await context.bot.send_message(cid, "✅ Бот снова работает, можно продолжать.")
         except Exception:
             pass
-
+            
 # ---------- Голосовые ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
