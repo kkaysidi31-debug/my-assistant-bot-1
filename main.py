@@ -273,7 +273,7 @@ if not is_auth(chat) and u.effective_user.id!=ADMIN_ID:
         if use_key(chat, text):
             await u.message.reply_text("✅ Доступ подтверждён! Теперь можно добавлять дела и использовать /affairs.")
         else:
-            await u.message.reply_text("❌ Неверный ключ. Пример: VIP003.")
+            await u.message.reply_text("❌ Неверный ключ. Пример: ABC123.")
         return
 
     # Удаление текстом "affairs delete 3"
