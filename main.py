@@ -418,7 +418,7 @@ async def affairs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tasks = list_active_tasks(chat_id)
     if not tasks:
         await update.message.reply_text("Пока дел нет.")
-      return
+        return
 
     now_tz = datetime.now(TZ)
     def next_run(t: Task) -> datetime:
