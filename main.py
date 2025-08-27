@@ -1,24 +1,25 @@
 import os
-import threading
+import asyncio
 from datetime import datetime, timedelta
 import pytz
-from flask import Flask, request
-import telebot
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import Message
 
 # ======================
-# Настройки
+# Конфиг
 # ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
-ADMIN_ID = 963586834  # твой ID
+ADMIN_ID = 963586834  # твой Telegram ID
 TZ = pytz.timezone("Europe/Kaliningrad")
 
-bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
 # ======================
 # Хранилище
 # ======================
-TASKS = {}
+TASKS = {}  # {task_id: {"uid":..., "text":..., "time":...}}
 MAINTENANCE = False
 PENDING_CHATS = set()
 
@@ -26,21 +27,25 @@ PENDING_CHATS = set()
 # ======================
 # Функции
 # ======================
-def set_task(uid, text, delay_sec):
+async def set_task(uid, text, delay_sec):
     run_at = datetime.now(TZ) + timedelta(seconds=delay_sec)
 
-    def job():
+    async def job():
         try:
-            bot.send_message(uid, f"⏰ Напоминание: {text}")
+            await bot.send_message(uid, f"⏰ Напоминание: {text}")
         except Exception as e:
             print("Ошибка отправки:", e)
 
-    t = threading.Timer(delay_sec, job)
-    t.start()
-
     task_id = f"{uid}_{int(run_at.timestamp())}"
     TASKS[task_id] = {"uid": uid, "text": text, "time": run_at}
+
+    asyncio.create_task(delayed_job(delay_sec, job))
     return task_id, run_at
+
+
+async def delayed_job(delay, coro):
+    await asyncio.sleep(delay)
+    await coro()
 
 
 def remove_task(task_id):
@@ -50,66 +55,68 @@ def remove_task(task_id):
 # ======================
 # Команды
 # ======================
-@bot.message_handler(commands=["start"])
-def start(message):
-    bot.reply_to(message,
-        "Бот запущен ✅\n"
-        "Примеры:\n"
-        "• через 60 секунд выпить воды\n"
-        "• через 300 секунд сходить в магазин\n"
-        "• /delete ID — удалить задачу\n"
-        "• /maintenance_on — включить тех. работы (только админ)\n"
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.reply(
+        "Бот запущен ✅\n\n"
+        "Пример: 'через 60 выпить воды'\n"
+        "Команды:\n"
+        "• /delete <ID> — удалить задачу\n"
+        "• /maintenance_on — включить тех. работы\n"
         "• /maintenance_off — выключить тех. работы"
     )
 
 
-@bot.message_handler(commands=["delete"])
-def delete(message):
+@dp.message(Command("delete"))
+async def cmd_delete(message: Message):
     parts = message.text.split()
     if len(parts) < 2:
-        bot.reply_to(message, "Укажи ID задачи для удаления")
+        await message.reply("Укажи ID задачи для удаления")
         return
     task_id = parts[1]
     removed = remove_task(task_id)
     if removed:
-        bot.reply_to(message, "Задача удалена ✅")
+        await message.reply("Задача удалена ✅")
     else:
-        bot.reply_to(message, "Задача не найдена ❌")
+        await message.reply("Задача не найдена ❌")
 
 
-@bot.message_handler(commands=["maintenance_on"])
-def maintenance_on(message):
+@dp.message(Command("maintenance_on"))
+async def cmd_maintenance_on(message: Message):
     global MAINTENANCE
     if message.from_user.id != ADMIN_ID:
         return
     MAINTENANCE = True
-    bot.reply_to(message, "🟡 Технические работы включены.")
+    await message.reply("🟡 Технические работы включены.")
 
 
-@bot.message_handler(commands=["maintenance_off"])
-def maintenance_off(message):
+@dp.message(Command("maintenance_off"))
+async def cmd_maintenance_off(message: Message):
     global MAINTENANCE
     if message.from_user.id != ADMIN_ID:
         return
     MAINTENANCE = False
-    bot.reply_to(message, "🟢 Технические работы выключены.")
+    await message.reply("🟢 Технические работы выключены.")
     while PENDING_CHATS:
         cid = PENDING_CHATS.pop()
-        bot.send_message(cid, "✅ Бот снова доступен!")
+        try:
+            await bot.send_message(cid, "✅ Бот снова доступен!")
+        except:
+            pass
 
 
 # ======================
-# Парсинг напоминаний
+# Обработка текста
 # ======================
-@bot.message_handler(func=lambda m: True)
-def handle_message(message):
+@dp.message()
+async def handle_message(message: Message):
     global MAINTENANCE
     uid = message.from_user.id
     text = message.text.strip()
 
     if MAINTENANCE and uid != ADMIN_ID:
         PENDING_CHATS.add(uid)
-        bot.reply_to(message, "⚠️ Бот на техобслуживании, попробуй позже.")
+        await message.reply("⚠️ Бот на техобслуживании, попробуй позже.")
         return
 
     if text.startswith("через"):
@@ -117,34 +124,22 @@ def handle_message(message):
             parts = text.split()
             delay = int(parts[1])  # секунды
             task_text = " ".join(parts[2:])
-            task_id, run_at = set_task(uid, task_text, delay)
-            bot.reply_to(message, f"✅ Задача сохранена (ID: {task_id}), напомню в {run_at.strftime('%H:%M:%S')}")
+            task_id, run_at = await set_task(uid, task_text, delay)
+            await message.reply(
+                f"✅ Задача сохранена (ID: {task_id}), напомню в {run_at.strftime('%H:%M:%S')}"
+            )
         except Exception:
-            bot.reply_to(message, "Не понял формат. Пример: через 60 выпить воды")
+            await message.reply("Не понял формат. Пример: через 60 выпить воды")
     else:
-        bot.reply_to(message, "Пример: 'через 300 сходить в магазин'")
-
-
-# ======================
-# Flask Webhook
-# ======================
-@app.route("/" + BOT_TOKEN, methods=["POST"])
-def getMessage():
-    json_str = request.get_data().decode("UTF-8")
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return "!", 200
-
-
-@app.route("/")
-def webhook():
-    bot.remove_webhook()
-    bot.set_webhook(url="https://YOUR_RENDER_URL.onrender.com/" + BOT_TOKEN)
-    return "Webhook set", 200
+        await message.reply("Пример: 'через 300 сходить в магазин'")
 
 
 # ======================
 # Запуск
 # ======================
+async def main():
+    await dp.start_polling(bot)
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    asyncio.run(main())
