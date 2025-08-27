@@ -1,17 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Telegram бот-напоминалка (приватный по ключам) + healthcheck HTTP для Render
-Функции:
-- приватные ключи VIP001..VIP100 (подсказка формата ABC123)
-- приветствие с примерами и пояснением "за час до встречи"
-- парсер фраз: "через N секунд/минут/часов", "сегодня в HH:MM", "завтра в HH:MM",
-  "каждый день в HH:MM", "DD.MM[.YYYY] в HH:MM", "DD <месяц> [YYYY] в HH:MM"
-- список дел:  /affairs
-- удаление:     affairs delete N
-- техработы:    /maintenance_on, /maintenance_off, /maintenance_status
-- ключи (админ): /keys, /keys_free, /keys_used, /keys_reset VIP001
-- планировщик с восстановлением задач после рестарта
-- healthcheck HTTP (порт $PORT) для Render Web Service
 """
 
 import logging
@@ -37,7 +26,7 @@ DB_PATH = "reminder_bot.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("reminder-bot")
 
-# -------------------- HEALTHCHECK (для Render Web Service) --------------------
+# -------------------- HEALTHCHECK (Render) --------------------
 class _HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, *args, **kwargs):
         return
@@ -95,7 +84,7 @@ def init_db():
         );
         """)
         conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('maintenance','0')")
-        # инициализируем ключи VIP001..VIP100 один раз
+        # ключи VIP001..VIP100
         existing = {r[0] for r in conn.execute("SELECT key FROM access_keys")}
         to_add = [(f"VIP{i:03d}",) for i in range(1, 101) if f"VIP{i:03d}" not in existing]
         if to_add:
@@ -186,13 +175,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Этот бот приватный. Введите приватный ключ в формате ABC123")
 
-# -------------------- ПАРСЕР ВВОДА --------------------
+# -------------------- ПАРСЕР --------------------
 MONTHS = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
     "мая": 5, "июня": 6, "июля": 7, "августа": 8,
     "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
 }
-
 RELATIVE_RE = re.compile(
     r"^\s*через\s+(\d+)\s*"
     r"(?:секунд(?:у|ы)?|сек|с|"
@@ -222,7 +210,7 @@ def parse_user_text_to_task(text: str, now_tz: datetime) -> Optional[ParsedTask]
     m = RELATIVE_RE.match(text)
     if m:
         amount = int(m.group(1))
-        title = m.group(2).strip()
+      title = m.group(2).strip()
         low = text.lower()
         if "сек" in low or re.search(r"\bс\b", low):
             delta = timedelta(seconds=amount)
@@ -279,7 +267,7 @@ def parse_user_text_to_task(text: str, now_tz: datetime) -> Optional[ParsedTask]
 
     return None
 
-# -------------------- МОДЕЛЬ И ХРАНИЛИЩЕ ЗАДАЧ --------------------
+# -------------------- МОДЕЛЬ/ХРАНИЛИЩЕ ЗАДАЧ --------------------
 @dataclass
 class Task:
     id: int
@@ -305,7 +293,8 @@ def row_to_task(row: Tuple) -> Task:
 
 def add_task(chat_id, title, ttype, run_at_utc, hour, minute, day_of_month):
     with db() as conn:
-        cur = conn.execute("""INSERT INTO tasks (chat_id,title,type,run_at_utc,hour,minute,day_of_month,tz,is_active,created_at_utc)
+        cur = conn.execute("""
+            INSERT INTO tasks (chat_id,title,type,run_at_utc,hour,minute,day_of_month,tz,is_active,created_at_utc)
             VALUES (?,?,?,?,?,?,?,?,1,?)
         """, (
             chat_id, title, ttype,
@@ -322,7 +311,7 @@ def get_task(task_id: int) -> Optional[Task]:
         return row_to_task(row) if row else None
 
 def cancel_task(task_id: int):
-    with db() as conn:
+  with db() as conn:
         conn.execute("UPDATE tasks SET is_active=0 WHERE id=?", (task_id,))
         conn.commit()
 
@@ -392,8 +381,12 @@ async def job_fire_monthly(ctx: ContextTypes.DEFAULT_TYPE):
         ctx.job_queue.run_once(job_fire_monthly, nxt.astimezone(timezone.utc),
                                name=f"task_{t.id}", data={"task_id": t.id})
 
-async def schedule_task(app: Application, t: Task):
+async def schedule_task(app: Application, t: Optional[Task]):
+    if app is None or t is None:
+        logging.warning("schedule_task: app or task is None (app=%s, task=%s)", app, t)
+        return
     jq = app.job_queue
+    # удалить старые джобы с тем же именем
     for j in jq.get_jobs_by_name(f"task_{t.id}"):
         j.schedule_removal()
     if not t.is_active:
@@ -425,7 +418,7 @@ async def affairs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tasks = list_active_tasks(chat_id)
     if not tasks:
         await update.message.reply_text("Пока дел нет.")
-        return
+      return
 
     now_tz = datetime.now(TZ)
     def next_run(t: Task) -> datetime:
@@ -483,8 +476,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Это дело уже удалено.")
                 return
             cancel_task(task_id)
-            for j in ctx.application.job_queue.get_jobs_by_name(f"task_{task_id}"):
-                j.schedule_removal()
+            jq = getattr(ctx.application, "job_queue", None)
+            if jq:
+                for j in jq.get_jobs_by_name(f"task_{task_id}"):
+                    j.schedule_removal()
             await update.message.reply_text(f"🗑 Удалено: «{t.title}».")
             mapping.pop(idx - 1)
             return
@@ -507,7 +502,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parsed.minute,
             parsed.day_of_month
         )
-        await schedule_task(ctx.application, get_task(task_id))
+        t = get_task(task_id)
+        if not t:
+            await update.message.reply_text("⚠️ Не удалось сохранить задачу. Попробуй ещё раз.")
+            return
+
+        await schedule_task(ctx.application, t)
 
         if parsed.type == "once":
             await update.message.reply_text(f"Отлично, напомню: «{parsed.title}» — {fmt_dt_kaliningrad(parsed.run_at_utc)}")
@@ -568,10 +568,7 @@ async def keys_free_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     with db() as conn:
         rows = conn.execute("SELECT key FROM access_keys WHERE used_by_chat_id IS NULL ORDER BY key").fetchall()
-    if not rows:
-        await update.message.reply_text("Свободных ключей нет.")
-        return
-    await update.message.reply_text("Свободные ключи:\n" + ", ".join(r[0] for r in rows))
+    await update.message.reply_text("Свободные ключи:\n" + (", ".join(r[0] for r in rows) if rows else "нет"))
 
 async def keys_used_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -579,10 +576,7 @@ async def keys_used_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     with db() as conn:
         rows = conn.execute("SELECT key, used_by_chat_id FROM access_keys WHERE used_by_chat_id IS NOT NULL ORDER BY key").fetchall()
-    if not rows:
-        await update.message.reply_text("Нет использованных ключей.")
-        return
-    await update.message.reply_text("Использованные ключи:\n" + "\n".join(f"{k} — chat {cid}" for k, cid in rows))
+    await update.message.reply_text("Использованные ключи:\n" + ("\n".join(f"{k} — chat {cid}" for k, cid in rows) if rows else "нет"))
 
 async def keys_reset_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -606,7 +600,7 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-# Команды
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("affairs", affairs_cmd))
     app.add_handler(CommandHandler("maintenance_on", maintenance_on_cmd))
@@ -621,6 +615,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     async def on_startup(app_: Application):
+        # Снять вебхук, чтобы polling не конфликтовал с getUpdates/webhook
+        await app_.bot.delete_webhook(drop_pending_updates=True)
         await reschedule_all(app_)
         log.info("Bot started. Timezone=%s", TZ)
 
