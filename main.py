@@ -11,7 +11,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ==== НАСТРОЙКИ ====
-BOT_TOKEN = "<<<СЮДА ТОКЕН>>>"
+BOT_TOKEN = "8492146866:AAHR_lrK9o18dGI0-ngfkVZUhbPQ4YSmr48"
 ADMIN_ID = 963586834
 TZ = ZoneInfo("Europe/Kaliningrad")
 DB = "assistant.db"
