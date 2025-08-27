@@ -180,7 +180,7 @@ async def schedule(app:Application, t:Task):
     for j in jq.get_jobs_by_name(f"task_{t.id}"): j.schedule_removal()
     if t.type=="once" and t.run_at_utc and t.run_at_utc>datetime.now(timezone.utc):
         jq.run_once(job_once, when=t.run_at_utc, name=f"task_{t.id}", data={"id":t.id})
-        elif t.type=="daily":
+    elif t.type=="daily":
         jq.run_daily(job_once, time=dtime(hour=t.hour,minute=t.minute,tzinfo=TZ),
                      name=f"task_{t.id}", data={"id":t.id})
     elif t.type=="monthly":
