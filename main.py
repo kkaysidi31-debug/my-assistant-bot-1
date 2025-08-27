@@ -198,7 +198,8 @@ def parse_user_text_to_task(text: str, now_tz: datetime) -> Optional[ParsedTask]
         return ParsedTask("once", title, run_local.astimezone(timezone.utc), None, None, None)
 
     m = DAILY_RE.match(text)
-    if m:h, mi, title = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+    if m:
+        h, mi, title = int(m.group(1)), int(m.group(2)), m.group(3).strip()
         return ParsedTask("daily", title, None, h, mi, None)
 
     m = DATE_RE_NUM.match(text)
