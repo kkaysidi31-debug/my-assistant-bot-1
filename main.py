@@ -568,7 +568,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"Отлично, напомню: каждое {t.day_of_month} число в {t.hour:02d}:{t.minute:02d} — «{t.title}»")
 
-# ---------- MAIN ----------
+# ================ MAIN ================
 def main():
     start_health()
     init_db()
@@ -592,13 +592,20 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     async def on_startup(app_: Application):
-        # убираем webhook, чтобы polling не конфликтовал
+        # убираем любой webhook, чтобы polling не конфликтовал (Conflict)
         await app_.bot.delete_webhook(drop_pending_updates=True)
         await reschedule_all(app_)
-        log.info("Bot started. Timezone=%s", TZ)
+        import telegram, sys
+        log.info(
+            "Bot started. TZ=%s | PTB=%s | Python=%s",
+            TZ,
+            getattr(telegram, "__version__", "unknown"),
+            sys.version.split()[0],
+        )
 
     app.post_init = on_startup
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling()  # максимально простой запуск без дополнительных аргументов
+
 
 if __name__ == "__main__":
     main()
