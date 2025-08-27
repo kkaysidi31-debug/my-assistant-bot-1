@@ -70,11 +70,12 @@ def init_db():
           day_of_month INTEGER
         );
         """)
-        # Заполним VIP001..VIP100, если пусто
+        # VIP001..VIP100 — добавим недостающие
         have = {r[0] for r in c.execute("SELECT key FROM access_keys")}
-        new_rows = [(f"VIP{i:03d}",) for i in range(1, 101) if f"VIP{i:03d}" not in have]
-        if new_rows:
-            c.executemany("INSERT INTO access_keys(key) VALUES(?)", new_rows)
+        for i in range(1, 101):
+            key = f"VIP{i:03d}"
+            if key not in have:
+                c.execute("INSERT INTO access_keys(key) VALUES(?)", (key,))
         c.commit()
 
 def is_auth(chat_id: int) -> bool:
@@ -87,10 +88,10 @@ def try_use_key(chat_id: int, text: str) -> bool:
     if not re.fullmatch(r"VIP\d{3}", key):
         return False
     with db() as c:
-        r = c.execute("SELECT used_by_chat_id FROM access_keys WHERE key=?", (key,)).fetchone()
-        if not r:
+        row = c.execute("SELECT used_by_chat_id FROM access_keys WHERE key=?", (key,)).fetchone()
+        if not row:
             return False
-        used_by = r[0]
+        used_by = row[0]
         if used_by and used_by != chat_id:
             return False
         c.execute(
@@ -124,8 +125,7 @@ def row_to_task(r: Tuple) -> Task:
         r[5], r[6], r[7]
     )
 
-def add_task(chat_id: int, title: str, typ: str,
-             run_at_utc: Optional[datetime], h: Optional[int],
+def add_task(chat_id: int, title: str, typ: str, run_at_utc: Optional[datetime], h: Optional[int],
              m: Optional[int], d: Optional[int]) -> int:
     with db() as c:
         cur = c.execute(
@@ -192,10 +192,12 @@ def parse_user_text_to_task(text: str, now_tz: datetime) -> Optional[ParsedTask]
             delta = timedelta(seconds=amount)
         elif unit.startswith("мин") or unit == "м":
             delta = timedelta(minutes=amount)
-        else:  # час/ч/часа/часов
+        else:
             delta = timedelta(hours=amount)
 
         run_local = now_tz + delta
+        # маленький сдвиг, чтобы точно было в будущем
+        run_local = run_local + timedelta(seconds=1)
         return ParsedTask("once", title, run_local.astimezone(timezone.utc), None, None, None)
 
     m = TODAY_RE.match(t)
@@ -225,9 +227,9 @@ def parse_user_text_to_task(text: str, now_tz: datetime) -> Optional[ParsedTask]
         mi = int(m.group(5) or 0)
         title = m.group(6).strip()
         run_local = datetime(y, mo, d, h, mi, tzinfo=TZ)
-        if run_local <= now_tz and not m.group(3):  # без указанного года — если прошло, то в след. году
+        if run_local <= now_tz and not m.group(3):
             run_local = datetime(y + 1, mo, d, h, mi, tzinfo=TZ)
-        return ParsedTask("once", title, run_local.astimezone(timezone.utc), None, None, None)
+            return ParsedTask("once", title, run_local.astimezone(timezone.utc), None, None, None)
 
     m = DMY_TXT_RE.match(t)
     if m:
@@ -257,22 +259,39 @@ async def job_once(ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(t.chat_id, f"🔔 Напоминание: {t.title}")
 
 async def schedule_task(app: Application, t: Task):
-    jq = app.job_queue
-    for j in jq.get_jobs_by_name(f"task_{t.id}"):
-        j.schedule_removal()
+    """Безопасно (без исключений) перепланируем задачу."""
+    try:
+        jq = app.job_queue
+        for j in jq.get_jobs_by_name(f"task_{t.id}"):
+            j.schedule_removal()
 
-    if t.type == "once" and t.run_at_utc and t.run_at_utc > datetime.now(timezone.utc):
-        jq.run_once(job_once, when=t.run_at_utc, name=f"task_{t.id}", data={"id": t.id})
-    elif t.type == "daily":
-        jq.run_daily(job_once, time=dtime(hour=t.hour, minute=t.minute, tzinfo=TZ),
-                     name=f"task_{t.id}", data={"id": t.id})
-    elif t.type == "monthly":
-        async def monthly_fire(ctx: ContextTypes.DEFAULT_TYPE):
-            tt = get_task(ctx.job.data["id"])
-            if tt and datetime.now(TZ).day == tt.day_of_month:
-                await ctx.bot.send_message(tt.chat_id, f"🔔 Напоминание: {tt.title}")
-        jq.run_daily(monthly_fire, time=dtime(hour=t.hour, minute=t.minute, tzinfo=TZ),
-                     name=f"task_{t.id}", data={"id": t.id})
+        if t.type == "once":
+            if not t.run_at_utc:
+                return
+            # если вдруг просрочено — сдвигаем на +15 секунд от текущего
+            now_utc = datetime.now(timezone.utc)
+            when = t.run_at_utc
+            if when <= now_utc:
+                when = now_utc + timedelta(seconds=15)
+            jq.run_once(job_once, when=when, name=f"task_{t.id}", data={"id": t.id})
+        elif t.type == "daily":
+            jq.run_daily(
+                job_once,
+                time=dtime(hour=t.hour, minute=t.minute, tzinfo=TZ),
+                name=f"task_{t.id}", data={"id": t.id}
+            )
+        elif t.type == "monthly":
+            async def monthly_fire(ctx: ContextTypes.DEFAULT_TYPE):
+                tt = get_task(ctx.job.data["id"])
+                if tt and datetime.now(TZ).day == tt.day_of_month:
+                    await ctx.bot.send_message(tt.chat_id, f"🔔 Напоминание: {tt.title}")
+            jq.run_daily(
+                monthly_fire,
+                time=dtime(hour=t.hour, minute=t.minute, tzinfo=TZ),
+                name=f"task_{t.id}", data={"id": t.id}
+            )
+    except Exception:
+        log.exception("schedule_task failed")
 
 async def reschedule_all(app: Application):
     with db() as c:
@@ -283,9 +302,10 @@ async def reschedule_all(app: Application):
 # ===================== КОМАНДЫ ==========================
 LAST_LIST_INDEX: dict[int, List[int]] = {}
 
-START_TEXT = (
-    "Этот бот приватный. Введите ключ доступа. Формат ABC123 (например, VIP003).\n\n"
-    "После ввода ключа можно добавлять напоминания в свободном тексте. Примеры:\n"
+WELCOME_TEXT = (
+    "Привет, я твой личный ассистент. Я помогу тебе оптимизировать все твои рутинные задачи, "
+    "чтобы ты сосредоточился на самом главном и ничего не забыл.\n\n"
+    "Примеры:\n"
     "• через 2 минуты поесть / через 30 секунд позвонить\n"
     "• сегодня в 18:30 попить воды\n"
     "• завтра в 09:00 сходить в зал\n"
@@ -294,8 +314,10 @@ START_TEXT = (
     "❗ Напоминание «за N минут»: просто поставь время на N минут раньше."
 )
 
+START_PROMPT = "Этот бот приватный. Введите ключ доступа в формате ABC123."
+
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(START_TEXT)
+    await update.message.reply_text(START_PROMPT)
 
 async def keys_left_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -305,7 +327,7 @@ async def keys_left_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def affairs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not (is_auth(chat_id) or update.effective_user.id == ADMIN_ID):
-        await update.message.reply_text("Бот приватный. Введите ключ доступа. Формат ABC123.")
+        await update.message.reply_text(START_PROMPT)
         return
 
     tasks = list_tasks(chat_id)
@@ -355,7 +377,7 @@ async def affairs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def affairs_delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not (is_auth(chat_id) or update.effective_user.id == ADMIN_ID):
-        await update.message.reply_text("Бот приватный. Введите ключ доступа.")
+        await update.message.reply_text(START_PROMPT)
         return
     if not ctx.args or not ctx.args[0].isdigit():
         await update.message.reply_text("Использование: /affairs_delete <номер> (смотри /affairs)")
@@ -373,7 +395,7 @@ async def affairs_delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Это дело уже удалено.")
 
-# ===================== ТЕКСТ: ДОБАВЛЕНИЕ =================
+# ===================== ТЕКСТ: ДОСТУП + ДОБАВЛЕНИЕ =========
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
@@ -381,7 +403,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ---- Приватный доступ
     if not is_auth(chat_id) and update.effective_user.id != ADMIN_ID:
         if try_use_key(chat_id, text):
-            await update.message.reply_text("✅ Доступ подтверждён! Теперь можно добавлять дела и использовать /affairs.")
+            await update.message.reply_text("✅ Ключ принят.")
+            await update.message.reply_text(WELCOME_TEXT)
         else:
             await update.message.reply_text("❌ Неверный ключ доступа.")
         return
@@ -410,7 +433,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠ Не понял. Пример: «через 5 минут поесть» или «сегодня в 18:30 позвонить».")
         return
 
-    # Сформируем подтверждение
+    # Подтверждение пользователю
     if p.type == "once":
         when_str = (p.run_utc or now_local.astimezone(timezone.utc)).astimezone(TZ).strftime("%d.%m.%Y %H:%M")
         confirm = f"Отлично, напомню: «{p.title}» — {when_str}"
@@ -419,25 +442,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         confirm = f"Отлично, напомню: каждое {p.d} число в {p.h:02d}:{p.m:02d} — «{p.title}»"
 
-    # Сразу отвечаем пользователю
     await update.message.reply_text(confirm)
 
-    # Сохраняем и планируем
-    try:
-        tid = add_task(chat_id, p.title, p.type, p.run_utc, p.h, p.m, p.d)
-        t = get_task(tid)
-        await schedule_task(ctx.application, t)
-    except Exception as e:
-        log.exception("Error on scheduling")
-        await update.message.reply_text("⚠ Задачу сохранил, но возникла ошибка при планировании. Попробую ещё раз через минуту.")
-        async def retry(_):
-            try:
-                tt = get_task(tid)
-                if tt:
-                    await schedule_task(ctx.application, tt)
-            except Exception:
-                log.exception("Retry schedule failed")
-        ctx.job_queue.run_once(lambda c: ctx.application.create_task(retry(c)), when=60)
+    # Сохраняем и планируем (без падений)
+    tid = add_task(chat_id, p.title, p.type, p.run_utc, p.h, p.m, p.d)
+    t = get_task(tid)
+    await schedule_task(ctx.application, t)
 
 # ========================= MAIN =========================
 def main():
