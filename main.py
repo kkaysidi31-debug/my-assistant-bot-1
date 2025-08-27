@@ -327,8 +327,8 @@ async def schedule_task(app: Application, t: Task):
                      name=f"task_{t.id}", data={"task_id": t.id})
     elif t.type == "monthly": 
       nxt = compute_next_for_monthly(t.day_of_month, t.hour, t.minute, datetime.now(TZ))
-        jq.run_once(job_fire_monthly, nxt.astimezone(timezone.utc),
-                    name=f"task_{t.id}", data={"task_id": t.id})
+      jq.run_once(job_fire_monthly, nxt.astimezone(timezone.utc),
+                  name=f"task_{t.id}", data={"task_id": t.id})
 
 async def reschedule_all(app: Application):
     with db() as conn:
