@@ -17,7 +17,7 @@ from telegram.ext import (
 )
 
 # ======================= НАСТРОЙКИ =======================
-BOT_TOKEN = "<<<ВСТАВЬ_СВОЙ_ТОКЕН_ТЕЛЕГРАМ>>>"
+BOT_TOKEN = "8492146866:AAHR_lrK9o18dGI0-ngfkVZUhbPQ4YSmr48"
 ADMIN_ID = 963586834
 TZ = ZoneInfo("Europe/Kaliningrad")
 DB_FILE = "assistant.db"
