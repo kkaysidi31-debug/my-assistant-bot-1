@@ -210,7 +210,7 @@ def parse_user_text_to_task(text: str, now_tz: datetime) -> Optional[ParsedTask]
     m = RELATIVE_RE.match(text)
     if m:
         amount = int(m.group(1))
-      title = m.group(2).strip()
+        title = m.group(2).strip()
         low = text.lower()
         if "сек" in low or re.search(r"\bс\b", low):
             delta = timedelta(seconds=amount)
