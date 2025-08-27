@@ -192,8 +192,8 @@ def parse_user_text_to_task(text: str, now_tz: datetime) -> Optional[ParsedTask]
     if m:
         h, mi, title = int(m.group(1)), int(m.group(2)), m.group(3).strip()
         run_local = now_tz.replace(hour=h, minute=mi, second=0, microsecond=0)
-    
-    if run_local <= now_tz: run_local += timedelta(days=1)
+        if run_local <= now_tz:
+            run_local += timedelta(days=1)
         return ParsedTask("once", title, run_local.astimezone(timezone.utc), None, None, None)
 
     m = TOMORROW_RE.match(text)
