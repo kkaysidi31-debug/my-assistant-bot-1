@@ -4,7 +4,7 @@ from threading import Thread
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-BOT_TOKEN = "<<<ВСТАВЬ СЮДА НОВЫЙ ТОКЕН>>>"
+BOT_TOKEN = "8492146866:AAHR_lrK9o18dGI0-ngfkVZUhbPQ4YSmr48"
 
 # healthcheck для Render
 class Health(BaseHTTPRequestHandler):
