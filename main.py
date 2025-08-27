@@ -303,7 +303,8 @@ def cancel_task(task_id: int):
         conn.execute("UPDATE tasks SET is_active=0 WHERE id=?", (task_id,))
         conn.commit()
 
-def list_active_tasks(chat_id: int) -> List[Task]:with db() as conn:
+def list_active_tasks(chat_id: int) -> List[Task]:
+    with db() as conn:
         return [row_to_task(r) for r in conn.execute(
             "SELECT * FROM tasks WHERE chat_id=? AND is_active=1", (chat_id,)
         )]
