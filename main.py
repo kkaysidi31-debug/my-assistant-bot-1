@@ -400,15 +400,59 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
 
-    # ---- Приватный доступ
-    if not is_auth(chat_id) and update.effective_user.id != ADMIN_ID:
-        if try_use_key(chat_id, text):
+    # --- 1) Обрабатываем ввод ключа ВСЕГДА (даже если уже авторизован)
+    if re.fullmatch(r"(?i)\s*vip\d{3}\s*", text):
+        ok = try_use_key(chat_id, text)
+        if ok:
             await update.message.reply_text("✅ Ключ принят.")
             await update.message.reply_text(WELCOME_TEXT)
         else:
             await update.message.reply_text("❌ Неверный ключ доступа.")
+        return  # ключ обработали — дальше как задачу не трактуем
+
+    # --- 2) Если ещё не авторизован — просим ключ
+    if not is_auth(chat_id) and update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Этот бот приватный. Введите ключ доступа в формате ABC123.")
         return
 
+    # --- 3) Удаление текстом: "affairs delete 3"
+    m = re.fullmatch(r"(?i)\s*affairs\s+delete\s+(\d+)\s*", text)
+    if m:
+        idx = int(m.group(1))
+        ids = LAST_LIST_INDEX.get(chat_id)
+        if not ids or idx < 1 or idx > len(ids):
+            await update.message.reply_text("Сначала открой /affairs.")
+            return
+        tid = ids[idx - 1]
+        t = get_task(tid)
+        if t:
+            delete_task(t.id)
+            await update.message.reply_text(f"🗑 Удалено: «{t.title}»")
+        else:
+            await update.message.reply_text("Это дело уже удалено.")
+        return
+
+    # --- 4) Добавление напоминания
+    now_local = datetime.now(TZ)
+    p = parse_user_text_to_task(text, now_local)
+    if not p:
+        await update.message.reply_text("⚠ Не понял. Пример: «через 5 минут поесть» или «сегодня в 18:30 позвонить».")
+        return
+
+    if p.type == "once":
+        when_str = (p.run_utc or now_local.astimezone(timezone.utc)).astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+        confirm = f"Отлично, напомню: «{p.title}» — {when_str}"
+    elif p.type == "daily":
+        confirm = f"Отлично, напомню: каждый день в {p.h:02d}:{p.m:02d} — «{p.title}»"
+    else:
+        confirm = f"Отлично, напомню: каждое {p.d} число в {p.h:02d}:{p.m:02d} — «{p.title}»"
+
+    await update.message.reply_text(confirm)
+
+    tid = add_task(chat_id, p.title, p.type, p.run_utc, p.h, p.m, p.d)
+    t = get_task(tid)
+    await schedule_task(ctx.application, t)
+    
     # ---- Удаление через текст: "affairs delete 3"
     m = re.fullmatch(r"(?i)\s*affairs\s+delete\s+(\d+)\s*", text)
     if m:
@@ -436,11 +480,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Подтверждение пользователю
     if p.type == "once":
         when_str = (p.run_utc or now_local.astimezone(timezone.utc)).astimezone(TZ).strftime("%d.%m.%Y %H:%M")
-        confirm = f"Отлично, напомню: «{p.title}» — {when_str}"
+        confirm = f"✅ Отлично, напомню: «{p.title}» — {when_str}"
     elif p.type == "daily":
-        confirm = f"Отлично, напомню: каждый день в {p.h:02d}:{p.m:02d} — «{p.title}»"
+        confirm = f"✅ Отлично, напомню: каждый день в {p.h:02d}:{p.m:02d} — «{p.title}»"
     else:
-        confirm = f"Отлично, напомню: каждое {p.d} число в {p.h:02d}:{p.m:02d} — «{p.title}»"
+        confirm = f"✅ Отлично, напомню: каждое {p.d} число в {p.h:02d}:{p.m:02d} — «{p.title}»"
 
     await update.message.reply_text(confirm)
 
