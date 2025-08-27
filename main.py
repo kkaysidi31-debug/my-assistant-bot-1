@@ -596,12 +596,8 @@ def main():
         await app_.bot.delete_webhook(drop_pending_updates=True)
         await reschedule_all(app_)
         import telegram, sys
-        log.info(
-            "Bot started. TZ=%s | PTB=%s | Python=%s",
-            TZ,
-            getattr(telegram, "__version__", "unknown"),
-            sys.version.split()[0],
-        )
+        log.info("Bot started. TZ=%s | PTB=%s | Python=%s",
+            TZ, getattr(telegram, "__version__", "unknown"), sys.version.split()[0] )
 
     app.post_init = on_startup
     app.run_polling()  # максимально простой запуск без дополнительных аргументов
