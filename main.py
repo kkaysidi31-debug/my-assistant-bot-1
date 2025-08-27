@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ==== НАСТРОЙКИ ====
+# ====================== НАСТРОЙКИ ======================
 BOT_TOKEN = "8492146866:AAHR_lrK9o18dGI0-ngfkVZUhbPQ4YSmr48"
 ADMIN_ID = 963586834
 TZ = ZoneInfo("Europe/Kaliningrad")
@@ -19,7 +19,7 @@ DB = "assistant.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("assistant")
 
-# ==== HEALTH ====
+# ====================== HEALTHCHECK ====================
 class Health(BaseHTTPRequestHandler):
     def log_message(self, *a, **k): pass
     def do_GET(self):
@@ -30,22 +30,33 @@ def start_health():
     srv = HTTPServer(("0.0.0.0", port), Health)
     Thread(target=srv.serve_forever, daemon=True).start()
 
-# ==== БД ====
+# ====================== БАЗА ДАННЫХ ====================
 def db(): return sqlite3.connect(DB, check_same_thread=False)
 
 def init_db():
     with db() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS users(chat_id INTEGER PRIMARY KEY, is_auth INTEGER NOT NULL DEFAULT 0, key_used TEXT);
-        CREATE TABLE IF NOT EXISTS access_keys(key TEXT PRIMARY KEY, used_by_chat_id INTEGER);
+        CREATE TABLE IF NOT EXISTS users(
+          chat_id INTEGER PRIMARY KEY,
+          is_auth INTEGER NOT NULL DEFAULT 0,
+          key_used TEXT
+        );
+        CREATE TABLE IF NOT EXISTS access_keys(
+          key TEXT PRIMARY KEY,
+          used_by_chat_id INTEGER
+        );
         CREATE TABLE IF NOT EXISTS tasks(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            type TEXT NOT NULL CHECK(type IN ('once','daily','monthly')),
-            run_at_utc TEXT, hour INTEGER, minute INTEGER, day_of_month INTEGER
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          chat_id INTEGER NOT NULL,
+          title TEXT NOT NULL,
+          type TEXT NOT NULL CHECK(type IN ('once','daily','monthly')),
+          run_at_utc TEXT,
+          hour INTEGER,
+          minute INTEGER,
+          day_of_month INTEGER
         );
         """)
+        # сгенерируем VIP001..VIP100, если нет
         have = {r[0] for r in c.execute("SELECT key FROM access_keys")}
         to_add = [(f"VIP{i:03d}",) for i in range(1,101) if f"VIP{i:03d}" not in have]
         if to_add: c.executemany("INSERT INTO access_keys(key) VALUES(?)", to_add)
@@ -100,7 +111,7 @@ def list_tasks(chat_id:int)->List[Task]:
 def delete_task(tid:int):
     with db() as c: c.execute("DELETE FROM tasks WHERE id=?", (tid,)); c.commit()
 
-# ==== ПАРСИНГ ====
+# ====================== ПАРСИНГ ========================
 MONTHS={"января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,
         "июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12}
 
@@ -123,8 +134,7 @@ def parse(text:str, now:datetime)->Optional[Parsed]:
         if u.startswith("сек") or u=="с": delta=timedelta(seconds=n)
         elif u.startswith("мин") or u=="м": delta=timedelta(minutes=n)
         else: delta=timedelta(hours=n)
-        run=(now+delta).astimezone(timezone.utc)
-        return Parsed("once", title, run, None,None,None)
+        return Parsed("once", title, (now+delta).astimezone(timezone.utc), None,None,None)
     m=TOD.match(text)
     if m:
         h,mi=int(m.group(1)),int(m.group(2)); title=m.group(3).strip()
@@ -158,7 +168,7 @@ def parse(text:str, now:datetime)->Optional[Parsed]:
         return Parsed("once", title, run.astimezone(timezone.utc), None,None,None)
     return None
 
-# ==== PLAN ====
+# ====================== ПЛАНИРОВЩИК ====================
 def fmt(dt_utc:datetime)->str: return dt_utc.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
 
 async def job_once(ctx: ContextTypes.DEFAULT_TYPE):
@@ -170,21 +180,23 @@ async def schedule(app:Application, t:Task):
     for j in jq.get_jobs_by_name(f"task_{t.id}"): j.schedule_removal()
     if t.type=="once" and t.run_at_utc and t.run_at_utc>datetime.now(timezone.utc):
         jq.run_once(job_once, when=t.run_at_utc, name=f"task_{t.id}", data={"id":t.id})
-    elif t.type=="daily":
-        jq.run_daily(job_once, time=dtime(hour=t.hour,minute=t.minute,tzinfo=TZ), name=f"task_{t.id}", data={"id":t.id})
+        elif t.type=="daily":
+        jq.run_daily(job_once, time=dtime(hour=t.hour,minute=t.minute,tzinfo=TZ),
+                     name=f"task_{t.id}", data={"id":t.id})
     elif t.type=="monthly":
         async def monthly(ctx: ContextTypes.DEFAULT_TYPE):
             tt=get_task(ctx.job.data["id"])
             if tt and datetime.now(TZ).day==tt.day_of_month:
                 await ctx.bot.send_message(tt.chat_id, f"🔔 Напоминание: {tt.title}")
-        jq.run_daily(monthly, time=dtime(hour=t.hour,minute=t.minute,tzinfo=TZ), name=f"task_{t.id}", data={"id":t.id})
+        jq.run_daily(monthly, time=dtime(hour=t.hour,minute=t.minute,tzinfo=TZ),
+                     name=f"task_{t.id}", data={"id":t.id})
 
 async def reschedule_all(app:Application):
     with db() as c:
         rows=c.execute("SELECT id,chat_id,title,type,run_at_utc,hour,minute,day_of_month FROM tasks").fetchall()
     for r in rows: await schedule(app, row2task(r))
 
-# ==== КОМАНДЫ ====
+# ====================== КОМАНДЫ ========================
 LAST={}
 
 async def start_cmd(u:Update, c:ContextTypes.DEFAULT_TYPE):
@@ -197,7 +209,7 @@ async def start_cmd(u:Update, c:ContextTypes.DEFAULT_TYPE):
       "• завтра в 09:00 сходить в зал\n"
       "• каждый день в 07:45 чистить зубы\n"
       "• 30 августа в 10:00 оплатить кредит\n\n"
-      "❗ Напоминание «за N минут»: просто поставь время на N минут раньше."
+      "❗ Напоминание «за N минут»: поставь время на N минут раньше."
     )
     await u.message.reply_text(msg)
 
@@ -212,15 +224,18 @@ async def affairs_cmd(u:Update, c:ContextTypes.DEFAULT_TYPE):
         if t.type=="once" and t.run_at_utc: return t.run_at_utc.astimezone(TZ)
         if t.type=="daily":
             cand=now.replace(hour=t.hour,minute=t.minute,second=0,microsecond=0)
-            if cand<=now: cand+=timedelta(days=1); return cand
+            if cand<=now: cand+=timedelta(days=1)
+            return cand
         y,m=now.year,now.month
         for _ in range(24):
             try:
                 cand=datetime(y,m,t.day_of_month,t.hour,t.minute,tzinfo=TZ)
                 if cand>now: return cand
-                m=1 if m==12 else m+1;  y+=1 if m==1 else 0
+                m=1 if m==12 else m+1
+                if m==1: y+=1
             except ValueError:
-                m=1 if m==12 else m+1;  y+=1 if m==1 else 0
+                m=1 if m==12 else m+1
+                if m==1: y+=1
         return now+timedelta(days=30)
     tasks=sorted(tasks, key=next_run)[:20]
     LAST[chat]=[t.id for t in tasks]
@@ -240,7 +255,7 @@ async def affairs_delete_cmd(u:Update, c:ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("Использование: /affairs_delete <номер>"); return
     idx=int(c.args[0]); ids=LAST.get(chat)
     if not ids or idx<1 or idx>len(ids):
-        await u.message.reply_text("Сначала покажи список /affairs и проверь номер."); return
+        await u.message.reply_text("Сначала открой список /affairs и проверь номер."); return
     tid=ids[idx-1]; t=get_task(tid)
     if t: delete_task(t.id); await u.message.reply_text(f"🗑 Удалено: «{t.title}»")
     else: await u.message.reply_text("Это дело уже удалено.")
@@ -249,42 +264,67 @@ async def keys_left_cmd(u:Update, c:ContextTypes.DEFAULT_TYPE):
     if u.effective_user.id!=ADMIN_ID: return
     await u.message.reply_text(f"Свободных ключей: {keys_left()} из 100.")
 
-# ==== ТЕКСТ ====
+# ====================== ТЕКСТ (ДОБАВЛЕНИЕ) =============
 async def handle_text(u:Update, c:ContextTypes.DEFAULT_TYPE):
     chat=u.effective_chat.id; text=(u.message.text or "").strip()
 
-    if not is_auth(chat) and u.effective_user.id!=ADMIN_ID:
+    # Авторизация
+if not is_auth(chat) and u.effective_user.id!=ADMIN_ID:
         if use_key(chat, text):
-            await u.message.reply_text("✅ Доступ подтверждён! Используй /affairs и добавляй дела.")
+            await u.message.reply_text("✅ Доступ подтверждён! Теперь можно добавлять дела и использовать /affairs.")
         else:
             await u.message.reply_text("❌ Неверный ключ. Пример: VIP003.")
         return
 
+    # Удаление текстом "affairs delete 3"
     m=re.fullmatch(r"(?i)\s*affairs\s+delete\s+(\d+)\s*", text)
     if m:
         idx=int(m.group(1)); ids=LAST.get(chat)
         if not ids or idx<1 or idx>len(ids):
-            await u.message.reply_text("Сначала /affairs."); return
+            await u.message.reply_text("Сначала открой /affairs."); return
         tid=ids[idx-1]; t=get_task(tid)
         if t: delete_task(t.id); await u.message.reply_text(f"🗑 Удалено: «{t.title}»")
         else: await u.message.reply_text("Это дело уже удалено.")
         return
 
-    now=datetime.now(TZ)
-    p=parse(text, now)
+    # ---------- ДОБАВЛЕНИЕ (с подтверждением СРАЗУ) ----------
+    now = datetime.now(TZ)
+    p = parse(text, now)
     if not p:
         await u.message.reply_text("⚠ Не понял. Пример: «через 5 минут поесть» или «сегодня в 18:30 позвонить».")
         return
 
-    tid=add_task(chat, p.title, p.typ, p.run_utc, p.h, p.m, p.d)
-    t=get_task(tid)
-    await schedule(c.application, t)
-    if t.type=="once": msg=f"Отлично, напомню: «{t.title}» — {fmt(t.run_at_utc)}"
-    elif t.type=="daily": msg=f"Отлично, напомню: каждый день в {t.hour:02d}:{t.minute:02d} — «{t.title}»"
-    else: msg=f"Отлично, напомню: каждое {t.day_of_month} число в {t.hour:02d}:{t.minute:02d} — «{t.title}»"
-    await u.message.reply_text(msg)
+    # формируем текст подтверждения
+    if p.typ == "once":
+        when_str = (p.run_utc or now.astimezone(timezone.utc)).astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+        confirm = f"Отлично, напомню: «{p.title}» — {when_str}"
+    elif p.typ == "daily":
+        confirm = f"Отлично, напомню: каждый день в {p.h:02d}:{p.m:02d} — «{p.title}»"
+    else:  # monthly
+        confirm = f"Отлично, напомню: каждое {p.d} число в {p.h:02d}:{p.m:02d} — «{p.title}»"
 
-# ==== MAIN ====
+    # 1) СРАЗУ отвечаем пользователю
+    await u.message.reply_text(confirm)
+
+    # 2) затем сохраняем и планируем
+    try:
+        tid = add_task(chat, p.title, p.typ, p.run_utc, p.h, p.m, p.d)
+        t = get_task(tid)
+        await schedule(c.application, t)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await u.message.reply_text("⚠ Задачу сохранил, но при планировании была ошибка. Попробую ещё раз через минуту.")
+        async def retry(ctx):
+            try:
+                tt = get_task(tid)
+                if tt: await schedule(c.application, tt)
+            except Exception:
+                traceback.print_exc()
+        c.job_queue.run_once(lambda ctx: c.application.create_task(retry(ctx)), when=60)
+    # -------------------------------------------------------
+
+# ====================== MAIN ===========================
 def main():
     start_health()
     init_db()
