@@ -184,6 +184,7 @@ def parse_user_text_to_task(text: str, now_tz: datetime) -> Optional[ParsedTask]
             delta = timedelta(hours=amount)
         else:
             delta = timedelta(minutes=amount)
+            
         run_local = now_tz + delta
         return ParsedTask("once", title, run_local.astimezone(timezone.utc), None, None, None)
 
