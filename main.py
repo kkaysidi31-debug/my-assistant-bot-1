@@ -276,17 +276,23 @@ if not is_auth(chat) and u.effective_user.id!=ADMIN_ID:
             await u.message.reply_text("❌ Неверный ключ. Пример: ABC123.")
         return
 
-    # Удаление текстом "affairs delete 3"
-    m=re.fullmatch(r"(?i)\s*affairs\s+delete\s+(\d+)\s*", text)
-    if m:
-        idx=int(m.group(1)); ids=LAST.get(chat)
-        if not ids or idx<1 or idx>len(ids):
-            await u.message.reply_text("Сначала открой /affairs."); return
-        tid=ids[idx-1]; t=get_task(tid)
-        if t: delete_task(t.id); await u.message.reply_text(f"🗑 Удалено: «{t.title}»")
-        else: await u.message.reply_text("Это дело уже удалено.")
-        return
-
+        # Удаление текстом "affairs delete 3"
+        m = re.fullmatch(r"(?:\s*affairs\s*delete\s+(\d+)\s*)", text)
+        if m:
+            idx = int(m.group(1))
+            ids = LAST.get(chat)
+            if not ids or idx < 1 or idx > len(ids):
+                await u.message.reply_text("Сначала открой /affairs.")
+                return
+            tid = ids[idx-1]
+            t = get_task(tid)
+            if t: 
+                delete_task(t.id)
+                await u.message.reply_text(f"❌ Удалено: {t.title}")
+            else:
+                await u.message.reply_text("Это дело уже удалено.")
+            return
+            
     # ---------- ДОБАВЛЕНИЕ (с подтверждением СРАЗУ) ----------
     now = datetime.now(TZ)
     p = parse(text, now)
