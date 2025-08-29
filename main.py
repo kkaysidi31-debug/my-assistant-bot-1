@@ -299,8 +299,8 @@ async def schedule_task(app: Application, task_id: int) -> None:
         return
     jq = app.job_queue
     # удалим старые джобы с этим task_id
-    for j in jq.get_jobs_by_name(f"task-{task_id}"):
-        j.schedule_removal()
+   for j in app.job_queue.get_jobs_by_name(f"task-{task_id}"):
+    j.schedule_removal()
 
     if t.type == "once" and t.run_at_utc:
         when = t.run_at_utc
@@ -544,6 +544,7 @@ def main():
     start_web_in_thread()
 
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    job_queue = app.job_queue  # теперь очередь задач не будет None
 
     # Команды
     app.add_handler(CommandHandler("start", start_cmd))
