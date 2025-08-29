@@ -1,4 +1,6 @@
 import os
+import asyncio
+from aiohttp import web
 import re
 import sqlite3
 import string
@@ -531,43 +533,68 @@ def start_web_in_thread():
     t = threading.Thread(target=run, daemon=True)
     t.start()
 
-# ---------------- MAIN ----------------
+# --- маленький веб-сервер для Render ---
+async def _alive(_request):
+    return web.Response(text="alive")
 
-def main():
+async def run_web():
+    app = web.Application()
+    app.router.add_get("/", _alive)
+    port = int(os.environ.get("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+# ======================= MAIN =======================
+async def on_startup(app):
+    # на всякий случай уберём старый webhook, чтобы polling не конфликтовал
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        print("delete_webhook failed:", e)
+
+async def main():
+    # переменные окружения
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
+    # инициализация БД/ключей, если у тебя есть такие функции
+    try:
+        init_db()              # оставь, если есть
+    except NameError:
+        pass
+    try:
+        ensure_keys_pool(1000) # оставь, если используешь пул ключей
+    except NameError:
+        pass
 
-    init_db()
-    ensure_keys_pool(1000)      # если у тебя есть функция с ключами — оставляем
-
-    # поднимаем HTTP-эндпоинт / для UptimeRobot в отдельном потоке
-    start_web_in_thread()
-
+    # собираем приложение PTB
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    job_queue = app.job_queue  # очередь задач
-    
-    # Команды
+    # регистрируем команды/хендлеры (оставь свои)
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("affairs", affairs_cmd))
     app.add_handler(CommandHandler("affairs_delete", affairs_delete_cmd))
-
-    # Админ-ключи (если используешь)
-    app.add_handler(CommandHandler("issue_key", issue_key_cmd))
-    app.add_handler(CommandHandler("keys_left", keys_left_cmd))
-    app.add_handler(CommandHandler("keys_free", keys_free_cmd))
-    app.add_handler(CommandHandler("keys_used", keys_used_cmd))
-    app.add_handler(CommandHandler("keys_reset", keys_reset_cmd))
-
-    # Текст
+    # админ-ключи, если используешь
+    try:
+        app.add_handler(CommandHandler("issue_key", issue_key_cmd))
+        app.add_handler(CommandHandler("keys_left", keys_left_cmd))
+        app.add_handler(CommandHandler("keys_free", keys_free_cmd))
+        app.add_handler(CommandHandler("keys_used", keys_used_cmd))
+        app.add_handler(CommandHandler("keys_reset", keys_reset_cmd))
+    except NameError:
+        pass
+    # текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # on_startup (асинхронная функция можно оставить — PTB сам вызовет)
+    # хук старта
     app.post_init = on_startup
 
-    # Запускаем polling (PTB сам управляет своим event loop)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    # Параллельно поднимаем HTTP и запускаем polling
+    await asyncio.gather(
+        run_web(),                                      # <-- порт для Render/UptimeRobot
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    )
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
