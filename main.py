@@ -514,6 +514,23 @@ async def on_startup(app: Application):
     except Exception as e:
         logging.warning("set_my_commands failed: %s", e)
 
+import threading
+from aiohttp import web
+
+# обработчик для проверки живости
+async def handle(request):
+    return web.Response(text="alive")
+
+# запуск aiohttp в отдельном потоке
+def start_web_in_thread():
+    def run():
+        app = web.Application()
+        app.add_routes([web.get("/", handle)])
+        web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
 # ---------------- MAIN ----------------
 
 def main():
