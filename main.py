@@ -573,17 +573,31 @@ async def main():
     # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # В on_startup чистим webhook и пересоздаём задачи
+    # Чистим старый webhook и пересоздаём задачи на старте
     app.post_init = on_startup
 
-    # 1) Поднимаем веб-сервер (для UptimeRobot) — НЕ блокируем
+    # 1) Поднимаем веб-сервер для UptimeRobot
     web_runner = await run_web()
 
     try:
-        # 2) Запускаем polling — это главный бесконечный процесс
-        await app.run_polling(allowed_updates=Update.ALL_TYPES)
+        # 2) Ручной жизненный цикл PTB (без run_polling!)
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+        # Блокируемся, пока идёт polling
+        await app.updater.wait()
     finally:
-        # 3) При выходе аккуратно гасим веб-сервер
+        # Корректное завершение
+        try:
+            await app.updater.stop()
+        except Exception:
+            pass
+        try:
+            await app.stop()
+            await app.shutdown()
+        except Exception:
+            pass
         try:
             await web_runner.cleanup()
         except Exception:
