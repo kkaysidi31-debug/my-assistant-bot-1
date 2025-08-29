@@ -573,13 +573,22 @@ async def main():
     # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    # В on_startup чистим webhook и пересоздаём задачи
     app.post_init = on_startup
 
-    # Запускаем одновременно polling и web-сервер
-    await asyncio.gather(
-        run_web(),
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
-    )
+    # 1) Поднимаем веб-сервер (для UptimeRobot) — НЕ блокируем
+    web_runner = await run_web()
+
+    try:
+        # 2) Запускаем polling — это главный бесконечный процесс
+        await app.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        # 3) При выходе аккуратно гасим веб-сервер
+        try:
+            await web_runner.cleanup()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     import asyncio
