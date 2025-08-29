@@ -14,6 +14,18 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 
+async def handle(request):
+    return web.Response(text="alive")
+
+async def run_web():
+    app = web.Application()
+    app.add_routes([web.get('/', handle)])
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
 # -------------------- НАСТРОЙКИ --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s")
 
@@ -539,13 +551,13 @@ async def on_startup(app: Application):
     except Exception as e:
         logging.exception("Reschedule failed: %s", e)
 
-def main():
+async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
 
     init_db()
 
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Команды
     app.add_handler(CommandHandler("start", start_cmd))
@@ -562,7 +574,13 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.post_init = on_startup
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Запускаем одновременно polling и web-сервер
+    await asyncio.gather(
+        run_web(),
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    )
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
