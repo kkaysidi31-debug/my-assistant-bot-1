@@ -549,46 +549,76 @@ async def maintenance_on_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def maintenance_off_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Режим обслуживания выключен.")
 
-# -------------------------------- MAIN --------------------------------------
+# ====================== НИЖНИЙ БЛОК ======================
+
+import asyncio
+from aiohttp import web
+
+# HTTP эндпоинт для UptimeRobot (GET / -> "alive")
+async def _alive(request):
+    return web.Response(text="alive")
+
+async def run_web():
+    app = web.Application()
+    app.add_routes([web.get("/", _alive)])
+    port = int(os.environ.get("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+# Выполняется при старте приложения
+async def on_startup(app: Application):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logging.warning("delete_webhook failed: %s", e)
+
+# --- заглушки для maintenance ---
+async def maintenance_on_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Режим обслуживания включен.")
+
+async def maintenance_off_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Режим обслуживания выключен.")
+
+# ---------------- MAIN ----------------
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render → Environment.")
 
     init_db()
-    # если используешь пул ключей — инициализируем (иначе безвредно)
     if "ensure_keys_pool" in globals():
         ensure_keys_pool(1000)
 
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Команды
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("affairs", affairs_cmd))
     app.add_handler(CommandHandler("affairs_delete", affairs_delete_cmd))
 
-    # Админ-команды для ключей (если не нужны — можно убрать эти 5 строк)
+    # Ключи (админ)
     app.add_handler(CommandHandler("issue_key", issue_key_cmd))
     app.add_handler(CommandHandler("keys_left", keys_left_cmd))
     app.add_handler(CommandHandler("keys_free", keys_free_cmd))
     app.add_handler(CommandHandler("keys_used", keys_used_cmd))
     app.add_handler(CommandHandler("keys_reset", keys_reset_cmd))
 
-    # Режим обслуживания (во избежание NameError теперь есть заглушки)
+    # Maintenance
     app.add_handler(CommandHandler("maintenance_on", maintenance_on_cmd))
     app.add_handler(CommandHandler("maintenance_off", maintenance_off_cmd))
 
-    # Текстовые сообщения
+    # Тексты
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Хук старта
     app.post_init = on_startup
 
-    # Запускаем одновременно polling и web-сервер для пингов
+    # ---- запускаем одновременно ----
     await asyncio.gather(
         run_web(),
-        app.run_polling(allowed_updates=Update.ALL_TYPES),
+        app.start(),    # вместо run_polling
     )
 
-if __name__ == "__main__":
+if name == "__main__":
     asyncio.run(main())
-# ====================== КОНЕЦ НИЖНЕГО БЛОКА ======================
+# ====================== КОНЕЦ ======================
