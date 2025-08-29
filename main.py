@@ -547,35 +547,30 @@ async def run_web():
     await site.start()
 
 # ======================= MAIN =======================
-async def on_startup(app):
-    # на всякий случай уберём старый webhook, чтобы polling не конфликтовал
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        print("delete_webhook failed:", e)
+import asyncio
 
 async def main():
-    # переменные окружения
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
-    # инициализация БД/ключей, если у тебя есть такие функции
+
+    # инициализация базы и ключей
     try:
-        init_db()              # оставь, если есть
+        init_db()
     except NameError:
         pass
     try:
-        ensure_keys_pool(1000) # оставь, если используешь пул ключей
+        ensure_keys_pool(1000)
     except NameError:
         pass
 
-    # собираем приложение PTB
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # регистрируем команды/хендлеры (оставь свои)
+    # команды
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("affairs", affairs_cmd))
     app.add_handler(CommandHandler("affairs_delete", affairs_delete_cmd))
-    # админ-ключи, если используешь
+
+    # ключи (админ)
     try:
         app.add_handler(CommandHandler("issue_key", issue_key_cmd))
         app.add_handler(CommandHandler("keys_left", keys_left_cmd))
@@ -584,17 +579,16 @@ async def main():
         app.add_handler(CommandHandler("keys_reset", keys_reset_cmd))
     except NameError:
         pass
-    # текст
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # хук старта
-    app.post_init = on_startup
-
-    # Параллельно поднимаем HTTP и запускаем polling
+    # чтобы polling и веб-сервер запускались вместе
     await asyncio.gather(
-        run_web(),                                      # <-- порт для Render/UptimeRobot
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+        run_web(),
+        app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
     )
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
