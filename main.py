@@ -1,101 +1,197 @@
+# main.py
 import os
 import re
 import sqlite3
 import logging
+import string
+import random
+import threading
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone, time as dtime
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple
+from datetime import datetime, timedelta, time as dtime, timezone
 
+from zoneinfo import ZoneInfo
 from aiohttp import web
-import telegram
-from telegram import Update          # ← правильно
+
+from telegram import Update
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler,
-    MessageHandler, ContextTypes, filters
+    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters,
 )
 
-async def handle(request):
-    return web.Response(text="alive")
+# ------------------------ НАСТРОЙКИ ------------------------
 
-async def run_web():
-    app = web.Application()
-    app.add_routes([web.get('/', handle)])
-    port = int(os.environ.get("PORT", 10000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-# -------------------- НАСТРОЙКИ --------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s | %(message)s"
+)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or "0")
-TZ = timezone(timedelta(hours=2))
 
-ptb_version = telegram.__version__
+TZ_NAME = os.environ.get("TZ", "Europe/Kaliningrad")
+try:
+    TZ = ZoneInfo(TZ_NAME)
+except Exception:
+    TZ = timezone.utc
 
-# Приватные ключи (VIP001..VIP100)
-ALL_KEYS = [f"VIP{str(i).zfill(3)}" for i in range(1, 101)]
+DB_PATH = os.environ.get("DB_PATH", "db.sqlite3")
 
-# Флаг обслуживания (admin-only)
-MAINTENANCE = False
-
-# Память для списка /affairs -> индексы выдачи
-LAST_LIST_INDEX: Dict[int, List[int]] = {}  # chat_id -> [task_id, ...]
+# Для пингов UptimeRobot (бесплатный Render)
+PORT = int(os.environ.get("PORT", "10000"))
 
 WELCOME_TEXT = (
-    "Привет, я твой личный ассистент. Я помогу тебе оптимизировать все твои рутинные задачи, "
-    "чтобы ты сосредоточился на самом главном и ничего не забыл.\n\n"
+    "Привет, я твой личный ассистент. Помогу тебе оптимизировать рутинные задачи, "
+    "чтобы ты ничего не забыл.\n\n"
     "Примеры:\n"
     "• через 2 минуты поесть / через 30 секунд позвонить\n"
     "• сегодня в 18:30 попить воды\n"
     "• завтра в 09:00 сходить в зал\n"
     "• каждый день в 07:45 чистить зубы\n"
     "• 30 августа в 10:00 оплатить кредит\n\n"
-    "❗ Напоминание «за N минут»: просто поставь время на N минут раньше."
+    "❗Напоминание «за N минут»: просто поставь время на N минут раньше."
 )
 
-# -------------------- СУБД --------------------
-DB_PATH = "bot.db"
+# ------------------------ БАЗА ДАННЫХ ------------------------
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_db():
+def init_db() -> None:
     with db() as c:
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS tasks(
+        c.execute("""CREATE TABLE IF NOT EXISTS auth(
+            chat_id INTEGER PRIMARY KEY,
+            ok INTEGER NOT NULL DEFAULT 0
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS tasks(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL,
             title TEXT NOT NULL,
-            type TEXT NOT NULL,                  -- once|daily|monthly
-            run_at_utc TEXT,                     -- ISO для once
-            hour INTEGER,                        -- для daily/monthly
-            minute INTEGER,                      -- для daily/monthly
-            day_of_month INTEGER                 -- для monthly
-        );
-        """)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS auth(
-            chat_id INTEGER PRIMARY KEY,
-            ok INTEGER NOT NULL DEFAULT 0
-        );
-        """)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS keys(
+            type TEXT NOT NULL,              -- once | daily | monthly
+            run_at_utc TEXT,                 -- ISO для once
+            hour INTEGER,                    -- для daily/monthly
+            minute INTEGER,
+            day_of_month INTEGER,            -- для monthly
+            active INTEGER NOT NULL DEFAULT 1
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS keys(
             key TEXT PRIMARY KEY,
-            used_by INTEGER
-        );
-        """)
-        # Инициализируем ключи, если пусто
-        cur = c.execute("SELECT COUNT(*) as n FROM keys;").fetchone()
-        if cur["n"] == 0:
-            c.executemany("INSERT OR IGNORE INTO keys(key, used_by) VALUES(?, NULL);",
-                          [(k,) for k in ALL_KEYS])
-    logging.info("DB ready")
+            used INTEGER NOT NULL DEFAULT 0,
+            used_by INTEGER,
+            used_at TEXT
+        )""")
+        c.commit()
+
+# 1000 случайных 5-символьных ключей, только если таблица пуста
+def ensure_keys_pool(n: int = 1000) -> None:
+    with db() as c:
+        cnt = c.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
+        if cnt >= n:
+            return
+        logging.info("Generating %d keys...", n - cnt)
+        alphabet = string.ascii_letters + string.digits
+        have = {row["key"] for row in c.execute("SELECT key FROM keys").fetchall()}
+        new_keys = set()
+        while len(new_keys) < (n - cnt):
+            k = "".join(random.choices(alphabet, k=5))
+            if k not in have and k not in new_keys:
+                new_keys.add(k)
+        c.executemany("INSERT OR IGNORE INTO keys(key, used) VALUES(?,0)", [(k,) for k in new_keys])
+        c.commit()
+        logging.info("Keys generated: %d", len(new_keys))
+
+# ------------------------ УТИЛИТЫ ВРЕМЕНИ ------------------------
+
+def now_tz() -> datetime:
+    return datetime.now(TZ)
+
+def to_utc(dt_local: datetime) -> datetime:
+    if dt_local.tzinfo is None:
+        dt_local = dt_local.replace(tzinfo=TZ)
+    return dt_local.astimezone(timezone.utc)
+
+def fmt_local(dt_utc: datetime) -> str:
+    return dt_utc.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+
+# ------------------------ АУТЕНТИФИКАЦИЯ ------------------------
+
+def is_auth(chat_id: int) -> bool:
+    with db() as c:
+        row = c.execute("SELECT ok FROM auth WHERE chat_id=?", (chat_id,)).fetchone()
+        return bool(row and row["ok"])
+def set_auth(chat_id: int, ok: bool = True) -> None:
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO auth(chat_id, ok) VALUES(?, ?)", (chat_id, 1 if ok else 0))
+        c.commit()
+
+def try_use_key(text: str, chat_id: int) -> bool:
+    """Вернёт True, если ключ подошёл и помечён использованным."""
+    k = text.strip()
+    if not (5 <= len(k) <= 8) or not all(ch in (string.ascii_letters + string.digits) for ch in k):
+        return False
+    with db() as c:
+        row = c.execute("SELECT key, used FROM keys WHERE key=?", (k,)).fetchone()
+        if not row or row["used"]:
+            return False
+        c.execute("UPDATE keys SET used=1, used_by=?, used_at=? WHERE key=?",
+                  (chat_id, datetime.utcnow().isoformat(), k))
+        c.commit()
+    set_auth(chat_id, True)
+    return True
+
+# ------------------------ КЛЮЧИ: КОМАНДЫ АДМИНА ------------------------
+
+async def keys_left_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    with db() as c:
+        free_cnt = c.execute("SELECT COUNT(*) FROM keys WHERE used=0").fetchone()[0]
+        used_cnt = c.execute("SELECT COUNT(*) FROM keys WHERE used=1").fetchone()[0]
+    await update.message.reply_text(f"Свободных ключей: {free_cnt}\nИспользованных: {used_cnt}")
+
+async def issue_key_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выдать один свободный ключ админам — просто показать, но НЕ помечать как used, пока пользователь не применит."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    with db() as c:
+        row = c.execute("SELECT key FROM keys WHERE used=0 ORDER BY RANDOM() LIMIT 1").fetchone()
+    if not row:
+        await update.message.reply_text("Свободных ключей не осталось.")
+        return
+    await update.message.reply_text(f"Ключ: `{row['key']}`", parse_mode="Markdown")
+
+async def keys_free_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    with db() as c:
+        rows = [r["key"] for r in c.execute("SELECT key FROM keys WHERE used=0 LIMIT 50")]
+    if not rows:
+        await update.message.reply_text("Свободных ключей нет.")
+    else:
+        await update.message.reply_text("Первые 50 свободных:\n" + ", ".join(rows))
+
+async def keys_used_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    with db() as c:
+        rows = [f"{r['key']} → {r['used_by']}" for r in c.execute("SELECT key,used_by FROM keys WHERE used=1 ORDER BY used_at DESC LIMIT 50")]
+    if not rows:
+        await update.message.reply_text("Использованных ключей пока нет.")
+    else:
+        await update.message.reply_text("Последние 50 использованных:\n" + "\n".join(rows))
+
+async def keys_reset_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сбросить все ключи в свободные (на всякий случай). Только админ."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    with db() as c:
+        c.execute("UPDATE keys SET used=0, used_by=NULL, used_at=NULL")
+        c.commit()
+    await update.message.reply_text("Все ключи сброшены в свободные.")
+
+# ------------------------ ТАСКИ ------------------------
 
 @dataclass
 class Task:
@@ -107,114 +203,138 @@ class Task:
     hour: Optional[int]
     minute: Optional[int]
     day_of_month: Optional[int]
+    active: int
 
-# -------------------- ВСПОМОГАТЕЛЬНЫЕ --------------------
-def _to_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=TZ)
-    return dt.astimezone(timezone.utc)
-
-def _future_utc(dt_utc: datetime) -> datetime:
-    now = datetime.now(timezone.utc)
-    if dt_utc <= now:
-        dt_utc = now + timedelta(seconds=2)
-    return dt_utc
-
-def fmt(dt_utc: datetime) -> str:
-    return dt_utc.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
-
-def is_auth(chat_id: int) -> bool:
+def add_once_task(chat_id: int, title: str, run_local: datetime) -> int:
+    run_utc = to_utc(run_local)
     with db() as c:
-        row = c.execute("SELECT ok FROM auth WHERE chat_id=?;", (chat_id,)).fetchone()
-        return bool(row and row["ok"])
+        c.execute("""INSERT INTO tasks(chat_id,title,type,run_at_utc,active)
+                     VALUES(?,?,?,?,1)""",
+                  (chat_id, title, "once", run_utc.isoformat()))
+        tid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        c.commit()
+        return tid
 
-def set_auth(chat_id: int, ok: bool):
+def add_daily_task(chat_id: int, title: str, hour: int, minute: int) -> int:
     with db() as c:
-        c.execute("INSERT OR REPLACE INTO auth(chat_id, ok) VALUES(?, ?);", (chat_id, 1 if ok else 0))
-def use_key(chat_id: int, key: str) -> bool:
-    key = key.strip().upper()
-    with db() as c:
-        row = c.execute("SELECT used_by FROM keys WHERE key=?;", (key,)).fetchone()
-        if not row:
-            return False
-        if row["used_by"] is not None:
-            return False
-        c.execute("UPDATE keys SET used_by=? WHERE key=?;", (chat_id, key))
-    set_auth(chat_id, True)
-    return True
+        c.execute("""INSERT INTO tasks(chat_id,title,type,hour,minute,active)
+                     VALUES(?,?,?,?,1)""",(chat_id, title, "daily", hour, minute))
+        tid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        c.commit()
+        return tid
 
-def list_keys() -> Tuple[List[str], List[Tuple[str,int]]]:
+def add_monthly_task(chat_id: int, title: str, day: int, hour: int, minute: int) -> int:
     with db() as c:
-        free = [r["key"] for r in c.execute("SELECT key FROM keys WHERE used_by IS NULL ORDER BY key;")]
-        used = [(r["key"], r["used_by"]) for r in c.execute("SELECT key, used_by FROM keys WHERE used_by IS NOT NULL ORDER BY key;")]
-    return free, used
-
-def reset_keys():
-    with db() as c:
-        c.execute("UPDATE keys SET used_by=NULL;")
-        c.execute("DELETE FROM auth;")
-
-def add_task(t: Task) -> int:
-    with db() as c:
-        cur = c.execute("""
-        INSERT INTO tasks(chat_id, title, type, run_at_utc, hour, minute, day_of_month)
-        VALUES(?, ?, ?, ?, ?, ?, ?);
-        """, (
-            t.chat_id, t.title, t.type,
-            t.run_at_utc.isoformat() if t.run_at_utc else None,
-            t.hour, t.minute, t.day_of_month
-        ))
-        return int(cur.lastrowid)
-
-def get_task(task_id: int) -> Optional[Task]:
-    with db() as c:
-        r = c.execute("SELECT * FROM tasks WHERE id=?;", (task_id,)).fetchone()
-    if not r: return None
-    return Task(
-        id=r["id"], chat_id=r["chat_id"], title=r["title"], type=r["type"],
-        run_at_utc=datetime.fromisoformat(r["run_at_utc"]).astimezone(timezone.utc) if r["run_at_utc"] else None,
-        hour=r["hour"], minute=r["minute"], day_of_month=r["day_of_month"]
-    )
+        c.execute("""INSERT INTO tasks(chat_id,title,type,day_of_month,hour,minute,active)
+                     VALUES(?,?,?,?,?,1)""",
+                  (chat_id, title, "monthly", day, hour, minute))
+        tid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        c.commit()
+        return tid
 
 def list_active_tasks(chat_id: int) -> List[Task]:
     with db() as c:
-        rows = c.execute("SELECT * FROM tasks WHERE chat_id=? ORDER BY id ASC;", (chat_id,)).fetchall()
-    res: List[Task] = []
-    for r in rows:
-        res.append(Task(
-            id=r["id"], chat_id=r["chat_id"], title=r["title"], type=r["type"],
-            run_at_utc=datetime.fromisoformat(r["run_at_utc"]).astimezone(timezone.utc) if r["run_at_utc"] else None,
-            hour=r["hour"], minute=r["minute"], day_of_month=r["day_of_month"]
-        ))
-    return res
+        rows = c.execute("SELECT * FROM tasks WHERE active=1 AND chat_id=? ORDER BY id ASC", (chat_id,)).fetchall()
+        return [
+            Task(
+                id=r["id"], chat_id=r["chat_id"], title=r["title"], type=r["type"],
+                run_at_utc=datetime.fromisoformat(r["run_at_utc"]) if r["run_at_utc"] else None,
+                hour=r["hour"], minute=r["minute"], day_of_month=r["day_of_month"], active=r["active"]
+            ) for r in rows
+        ]
 
-def delete_task(task_id: int) -> bool:
+def delete_task(tid: int) -> bool:
     with db() as c:
-        cur = c.execute("DELETE FROM tasks WHERE id=?;", (task_id,))
-        return cur.rowcount > 0
+        row = c.execute("SELECT id FROM tasks WHERE id=? AND active=1", (tid,)).fetchone()
+        if not row:
+            return False
+        c.execute("UPDATE tasks SET active=0 WHERE id=?", (tid,))
+        c.commit()
+        return True
 
-# -------------------- ПАРСИНГ ТЕКСТА --------------------
-MONTHS = {
-    "января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,
-    "июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12
-}
+# ------------------------ ПЛАНИРОВАНИЕ ------------------------
 
-RELATIVE_RE = re.compile(r"(?i)^через\s+(\d+)\s+(секунд\w*|минут\w*|час\w*)\s+(.+)$")
-TODAY_RE    = re.compile(r"(?i)^(?:сегодня)\s+в?\s*(\d{1,2}):(\d{2})\s+(.+)$")
-TOMORROW_RE = re.compile(r"(?i)^(?:завтра)\s+в?\s*(\d{1,2}):(\d{2})\s+(.+)$")
-DAILY_RE    = re.compile(r"(?i)^(?:каждый\s+день|ежедневно)\s+в?\s*(\d{1,2}):(\d{2})\s+(.+)$")
-MONTHLY_RE  = re.compile(r"(?i)^(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+в\s+(\d{1,2}):(\d{2})\s+(.+)$")
+async def job_once(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    data = ctx.job.data or {}
+    chat_id = data.get("chat_id")
+    title = data.get("title", "")
+    tid = data.get("id")
+    if not chat_id or not tid:
+        return
+    try:
+        await ctx.bot.send_message(chat_id, f"🔔 Напоминание: «{title}»")
+    finally:
+        # деактивируем разовую задачу
+        with db() as c:
+            c.execute("UPDATE tasks SET active=0 WHERE id=?", (tid,))
+            c.commit()
+
+async def schedule_task(app: Application, t: Task) -> None:
+    jq = app.job_queue
+    if t.type == "once" and t.run_at_utc:
+        delay = (t.run_at_utc - datetime.now(timezone.utc)).total_seconds()
+        if delay < 0:
+            return
+        jq.run_once(job_once, when=delay, data={"id": t.id, "chat_id": t.chat_id, "title": t.title}, name=f"task_{t.id}")
+    elif t.type == "daily":
+        jq.run_daily(
+            job_once,
+            time=dtime(hour=t.hour or 0, minute=t.minute or 0, tzinfo=TZ),
+            data={"id": t.id, "chat_id": t.chat_id, "title": t.title},
+            name=f"task_{t.id}"
+        )
+    elif t.type == "monthly":
+        async def monthly_alarm(ctx: ContextTypes.DEFAULT_TYPE):
+            today = now_tz().day
+            if today == (t.day_of_month or 1):
+                await job_once(ctx)
+        jq.run_daily(
+            monthly_alarm,
+            time=dtime(hour=t.hour or 0, minute=t.minute or 0, tzinfo=TZ),
+            name=f"task_{t.id}"
+        )
+
+async def reschedule_all(app: Application) -> None:
+    try:
+        app.job_queue.scheduler.remove_all_jobs()
+    except Exception:
+        pass
+    for t in list_active_tasks_for_all():
+        try:
+            await schedule_task(app, t)
+        except Exception:
+            logging.exception("Failed to schedule task id=%s", t.id)
+
+def list_active_tasks_for_all() -> List[Task]:
+    with db() as c:
+        rows = c.execute("SELECT * FROM tasks WHERE active=1").fetchall()
+        res = []
+        for r in rows:
+            res.append(Task(
+                id=r["id"], chat_id=r["chat_id"], title=r["title"], type=r["type"],
+                run_at_utc=datetime.fromisoformat(r["run_at_utc"]) if r["run_at_utc"] else None,
+                hour=r["hour"], minute=r["minute"], day_of_month=r["day_of_month"], active=r["active"]
+            ))
+        return res
+
+# ------------------------ ПАРСИНГ ТЕКСТА ------------------------
+
+RELATIVE_RE = re.compile(r"^\s*через\s+(\d+)\s*(секунд\w*|минут\w*|час\w*)\s+(.+)$", re.IGNORECASE)
+TODAY_RE    = re.compile(r"^\s*сегодня\s+в\s+(\d{1,2}):(\d{2})\s+(.+)$", re.IGNORECASE)
+TOMORROW_RE = re.compile(r"^\s*завтра\s+в\s+(\d{1,2}):(\d{2})\s+(.+)$", re.IGNORECASE)
+DAILY_RE    = re.compile(r"^\s*каждый\s+день\s+в\s+(\d{1,2}):(\d{2})\s+(.+)$", re.IGNORECASE)
+MONTHLY_RE  = re.compile(r"^\s*(\d{1,2})\s+август\w*\s+в\s+(\d{1,2}):(\d{2})\s+(.+)$", re.IGNORECASE)
 
 @dataclass
 class ParsedTask:
-    type: str                 # once|daily|monthly
+    type: str                # once|daily|monthly
     title: str
-    run_at_utc: Optional[datetime]
-    hour: Optional[int]
-    minute: Optional[int]
-    day_of_month: Optional[int]
+    run_local: Optional[datetime] = None
+    hour: Optional[int] = None
+    minute: Optional[int] = None
+    day_of_month: Optional[int] = None
 
-def parse_user_text_to_task(text: str, now_tz: datetime) -> Optional[ParsedTask]:
+def parse_user_text_to_task(text: str, now_local: datetime) -> Optional[ParsedTask]:
     t = text.strip()
 
     m = RELATIVE_RE.match(t)
@@ -222,349 +342,179 @@ def parse_user_text_to_task(text: str, now_tz: datetime) -> Optional[ParsedTask]
         amount = int(m.group(1))
         unit = m.group(2).lower()
         title = m.group(3).strip()
-        if re.search(r"секунд", unit):
+        delta = timedelta()
+        if unit.startswith("сек"):
             delta = timedelta(seconds=amount)
-        elif re.search(r"минут", unit):
+        elif unit.startswith("мин"):
             delta = timedelta(minutes=amount)
-        elif re.search(r"час", unit):
-            delta = timedelta(hours=amount)
         else:
-            delta = timedelta(minutes=amount)
-        run_local = now_tz + delta
-        return ParsedTask("once", title, _to_utc(run_local), None, None, None)
+            delta = timedelta(hours=amount)
+        return ParsedTask("once", title, run_local=now_local + delta)
 
     m = TODAY_RE.match(t)
     if m:
-        h, mi, title = int(m.group(1)), int(m.group(2)), m.group(3).strip()
-        run_local = now_tz.replace(hour=h, minute=mi, second=0, microsecond=0)
-        if run_local <= now_tz:
-            run_local = run_local + timedelta(days=1)
-        return ParsedTask("once", title, _to_utc(run_local), None, None, None)
+        hh, mm, title = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+        run_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return ParsedTask("once", title, run_local=run_local)
 
     m = TOMORROW_RE.match(t)
     if m:
-        h, mi, title = int(m.group(1)), int(m.group(2)), m.group(3).strip()
-        run_local = (now_tz + timedelta(days=1)).replace(hour=h, minute=mi, second=0, microsecond=0)
-        return ParsedTask("once", title, _to_utc(run_local), None, None, None)
+        hh, mm, title = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+        run_local = (now_local + timedelta(days=1)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return ParsedTask("once", title, run_local=run_local)
 
     m = DAILY_RE.match(t)
     if m:
-        h, mi, title = int(m.group(1)), int(m.group(2)), m.group(3).strip()
-        return ParsedTask("daily", title, None, h, mi, None)
+        hh, mm, title = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+        return ParsedTask("daily", title, hour=hh, minute=mm)
 
+    # пример простого «30 августа в 10:00 ...»
     m = MONTHLY_RE.match(t)
     if m:
         day = int(m.group(1))
-        mon = MONTHS[m.group(2).lower()]
-        h, mi = int(m.group(3)), int(m.group(4))
-        title = m.group(5).strip()
-        # Для monthly храним только день/час/минуты
-        return ParsedTask("monthly", title, None, h, mi, day)
+        hh, mm = int(m.group(2)), int(m.group(3))
+        title = m.group(4).strip()
+        return ParsedTask("monthly", title, day_of_month=day, hour=hh, minute=mm)
 
     return None
 
-# -------------------- JOB QUEUE --------------------
-async def job_once(ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        t_id = ctx.job.data["id"]
-        t = get_task(t_id)
-        if not t:
-            return
-        await ctx.bot.send_message(t.chat_id, f"🔔 Напоминание: «{t.title}»")
-        if t.type == "once":
-            delete_task(t.id)
-    except Exception as e:
-        logging.exception("job_once failed: %s", e)
+# ------------------------ КОМАНДЫ ------------------------
 
-async def schedule(app: Application, t: Task):
-    jq = app.job_queue
-    try:
-        if t.type == "once":
-            run_at = _future_utc(t.run_at_utc)
-            jq.run_once(job_once, when=run_at, name=f"task_{t.id}", data={"id": t.id})
-        elif t.type == "daily":
-            jq.run_daily(job_once,
-                         time=dtime(hour=t.hour, minute=t.minute, tzinfo=TZ),
-                         name=f"task_{t.id}", data={"id": t.id})
-        elif t.type == "monthly":
-            async def monthly_wrapper(ctx: ContextTypes.DEFAULT_TYPE):
-                tloc = get_task(ctx.job.data["id"])
-                now_local = datetime.now(TZ)
-                if tloc and now_local.day == tloc.day_of_month:
-                    await job_once(ctx)
-            jq.run_daily(monthly_wrapper,
-                         time=dtime(hour=t.hour, minute=t.minute, tzinfo=TZ),
-                         name=f"task_{t.id}", data={"id": t.id})
-        else:
-            logging.warning("Unknown task type %s", t.type)
-            return
-    except Exception as e:
-        logging.exception("schedule failed: %s", e)
-        # Сообщаем и пробуем ретрай
-        try:
-            await app.bot.send_message(
-                chat_id=t.chat_id,
-                text="⚠️ Задачу сохранил, но возникла ошибка при планировании. Попробую ещё раз через минуту."
-            )
-        except Exception:
-            pass
-
-        def _retry(_ctx):
-            try:
-                if t.type == "once":
-                    t.run_at_utc = datetime.now(timezone.utc) + timedelta(minutes=1)
-                app.create_task(schedule(app, t))
-            except Exception:
-                logging.exception("Retry schedule failed")
-
-        app.job_queue.run_once(_retry, when=timedelta(minutes=1))
-
-async def reschedule_all(app: Application):
-    for t in list_active_tasks_for_all():
-        await schedule(app, t)
-
-def list_active_tasks_for_all() -> List[Task]:
-    with db() as c:
-        rows = c.execute("SELECT * FROM tasks;").fetchall()
-    res = []
-    for r in rows:
-        res.append(Task(
-            id=r["id"], chat_id=r["chat_id"], title=r["title"], type=r["type"],
-            run_at_utc=datetime.fromisoformat(r["run_at_utc"]).astimezone(timezone.utc) if r["run_at_utc"] else None,
-            hour=r["hour"], minute=r["minute"], day_of_month=r["day_of_month"]
-        ))
-    return res
-
-# -------------------- ХЭЛС-ЭНДПОИНТ --------------------
-async def start_health():
-    async def handle(_request):
-        return web.Response(text="alive", status=200)
-    app = web.Application()
-    app.router.add_get("/", handle)
-    port = int(os.environ.get("PORT", "10000"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    await site.start()
-    logging.info("Health server on 0.0.0.0:%s", port)
-
-# -------------------- КОМАНДЫ --------------------
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Этот бот приватный. Введите ключ доступа в формате ABC123.")
-    if ADMIN_ID and update.effective_user and update.effective_user.id == ADMIN_ID:
-        logging.info("Admin started the bot")
-
-async def maintenance_on_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    global MAINTENANCE; MAINTENANCE = True
-    await update.message.reply_text("🔧 Режим обслуживания включён.")
-
-async def maintenance_off_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    global MAINTENANCE; MAINTENANCE = False
-    await update.message.reply_text("✅ Режим обслуживания выключен.")
-
-async def keys_left_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    free, used = list_keys()
-    await update.message.reply_text(f"Свободных ключей: {len(free)}")
-
-async def keys_free_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    free, _ = list_keys()
-    await update.message.reply_text("Свободные:\n" + (", ".join(free) if free else "—"))
-
-async def keys_used_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    _, used = list_keys()
-    if not used:
-        await update.message.reply_text("Использованных нет.")
-        return
-    txt = "\n".join(f"{k} → {uid}" for k, uid in used)
-    await update.message.reply_text(txt)
-
-async def keys_reset_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    reset_keys()
-    await update.message.reply_text("Ключи и доступы сброшены.")
-
-def guard_maintenance(update: Update) -> bool:
-    if not MAINTENANCE:
-        return False
-    if update.effective_user and update.effective_user.id == ADMIN_ID:
-        return False
-    # пользователям во время обслуживания
-    if update.message:
-        update.message.reply_text("🔧 Бот на обслуживании. Попробуй позже.")
-    return True
+    await update.message.reply_text("Этот бот приватный. Введите ключ доступа.")
 
 async def affairs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if guard_maintenance(update): return
-    chat_id = update.effective_chat.id
-    tasks = list_active_tasks(chat_id)
+    chat = update.effective_chat.id
+    if not is_auth(chat):
+        await update.message.reply_text("Этот бот приватный. Введите ключ доступа.")
+        return
+    tasks = list_active_tasks(chat)
     if not tasks:
         await update.message.reply_text("Пока дел нет.")
         return
-
-    # Сортируем по ближайшему запуску
-    def next_run(t: Task) -> datetime:
-        now = datetime.now(TZ)
-        if t.type == "once":
-            return t.run_at_utc.astimezone(TZ)
-        elif t.type == "daily":
-            cand = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
-            if cand <= now: cand += timedelta(days=1)
-            return cand
-        else:
-            # monthly
-            cand = now.replace(day=min(t.day_of_month, 28), hour=t.hour, minute=t.minute, second=0, microsecond=0)
-            while cand.day != t.day_of_month:
-                cand += timedelta(days=1)
-            if cand <= now:
-                # следующий месяц
-                nm = (now.replace(day=1) + timedelta(days=32)).replace(day=1)
-                cand = nm.replace(day=min(t.day_of_month, 28), hour=t.hour, minute=t.minute, second=0, microsecond=0)
-                while cand.day != t.day_of_month:
-                    cand += timedelta(days=1)
-            return cand
-
-    tasks_sorted = sorted(tasks, key=next_run)[:20]
-    LAST_LIST_INDEX[chat_id] = [t.id for t in tasks_sorted]
-
     lines = []
-    for i, t in enumerate(tasks_sorted, 1):
-        if t.type == "once":
-            when = fmt(t.run_at_utc)
+    for i, t in enumerate(tasks, 1):
+        if t.type == "once" and t.run_at_utc:
+            lines.append(f"{i}. {t.title} — {fmt_local(t.run_at_utc)} (#{t.id})")
         elif t.type == "daily":
-            when = f"каждый день в {str(t.hour).zfill(2)}:{str(t.minute).zfill(2)}"
+            lines.append(f"{i}. {t.title} — каждый день в {t.hour:02d}:{t.minute:02d} (#{t.id})")
         else:
-            when = f"каждое {t.day_of_month}-е в {str(t.hour).zfill(2)}:{str(t.minute).zfill(2)}"
-        lines.append(f"{i}. {t.title} — {when}")
+            lines.append(f"{i}. {t.title} — {t.day_of_month} числа в {t.hour:02d}:{t.minute:02d} (#{t.id})")
     await update.message.reply_text("Твои дела:\n" + "\n".join(lines))
 
 async def affairs_delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if guard_maintenance(update): return
-    chat_id = update.effective_chat.id
-    if not ctx.args:
-        await update.message.reply_text("Используй: /affairs_delete N")
+    chat = update.effective_chat.id
+    if not is_auth(chat):
+        await update.message.reply_text("Этот бот приватный. Введите ключ доступа.")
         return
-    try:
-        idx = int(ctx.args[0])
-    except Exception:
-        await update.message.reply_text("Номер должен быть числом.")
+    m = re.fullmatch(r"(?:/?affairs\s*delete\s*|/affairs_delete\s*)(\d+)", update.message.text.strip(), re.IGNORECASE)
+    if not m:
+        await update.message.reply_text("Формат: /affairs_delete <id>")
         return
-    ids = LAST_LIST_INDEX.get(chat_id, [])
-    if not ids or idx < 1 or idx > len(ids):
-        await update.message.reply_text("Сначала открой /affairs.")
-        return
-    t_id = ids[idx-1]
-    t = get_task(t_id)
-    if t and delete_task(t_id):
-        await update.message.reply_text(f"❌ Удалено: «{t.title}»")
+    tid = int(m.group(1))
+    if delete_task(tid):
+        await update.message.reply_text("✅ Удалено.")
     else:
-        await update.message.reply_text("Это дело уже удалено.")
+        await update.message.reply_text("Это дело уже удалено или не найдено.")
 
-# -------------------- ТЕКСТ --------------------
-AFFAIRS_DELETE_TEXT_RE = re.compile(r"(?i)^\s*affairs\s*delete\s+(\d+)\s*$")
+# ------------------------ ТЕКСТ ------------------------
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if guard_maintenance(update): return
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
 
-    # --- Авторизация по ключу ---
-    if not is_auth(chat_id) and (not update.effective_user or update.effective_user.id != ADMIN_ID):
-        if use_key(chat_id, text):
+# попытка применить ключ, если не авторизован
+    if not is_auth(chat_id):
+        if try_use_key(text, chat_id):
             await update.message.reply_text("✅ Ключ принят.")
             await update.message.reply_text(WELCOME_TEXT)
         else:
             await update.message.reply_text("❌ Неверный ключ доступа.")
         return
 
-    # --- Удаление через текст "affairs delete 3" ---
-    m = AFFAIRS_DELETE_TEXT_RE.fullmatch(text)
-    if m:
-        ids = LAST_LIST_INDEX.get(chat_id, [])
-        idx = int(m.group(1))
-        if not ids or idx < 1 or idx > len(ids):
-            await update.message.reply_text("Сначала открой /affairs.")
-            return
-        t_id = ids[idx-1]
-        t = get_task(t_id)
-        if t and delete_task(t_id):
-            await update.message.reply_text(f"❌ Удалено: «{t.title}»")
-        else:
-            await update.message.reply_text("Это дело уже удалено.")
-        return
-
-    # --- Добавление задач ---
-    now_local = datetime.now(TZ)
-    parsed = parse_user_text_to_task(text, now_local)
-    if not parsed:
+    # парс и создание задачи
+    p = parse_user_text_to_task(text, now_tz())
+    if not p:
         await update.message.reply_text("⚠️ Не понял. Пример: «через 5 минут поесть» или «сегодня в 18:30 позвонить».")
         return
 
-    task = Task(
-        id=0, chat_id=chat_id, title=parsed.title, type=parsed.type,
-        run_at_utc=parsed.run_at_utc if parsed.type == "once" else None,
-        hour=parsed.hour, minute=parsed.minute, day_of_month=parsed.day_of_month
-    )
-    new_id = add_task(task)
-    task.id = new_id
-    await schedule(ctx.application, task)
-
-    if task.type == "once":
-        await update.message.reply_text(f"✅ Отлично, напомню: «{task.title}» — {fmt(task.run_at_utc)}")
-    elif task.type == "daily":
-        await update.message.reply_text(f"✅ Отлично, напомню: каждый день в {str(task.hour).zfill(2)}:{str(task.minute).zfill(2)} — «{task.title}»")
+    if p.type == "once" and p.run_local:
+        tid = add_once_task(chat_id, p.title, p.run_local)
+        t = Task(tid, chat_id, p.title, "once", to_utc(p.run_local), None, None, None, 1)
+        await schedule_task(ctx.application, t)
+        await update.message.reply_text(f"✅ Отлично, напомню: «{p.title}» — {p.run_local.strftime('%d.%m.%Y %H:%M')}")
+    elif p.type == "daily":
+        tid = add_daily_task(chat_id, p.title, p.hour or 0, p.minute or 0)
+        t = Task(tid, chat_id, p.title, "daily", None, p.hour, p.minute, None, 1)
+        await schedule_task(ctx.application, t)
+        await update.message.reply_text(f"✅ Отлично, напомню каждый день в {p.hour:02d}:{p.minute:02d}: «{p.title}».")
     else:
-        await update.message.reply_text(f"✅ Отлично, напомню: {task.day_of_month}-го числа в {str(task.hour).zfill(2)}:{str(task.minute).zfill(2)} — «{task.title}»")
+        tid = add_monthly_task(chat_id, p.title, p.day_of_month or 1, p.hour or 0, p.minute or 0)
+        t = Task(tid, chat_id, p.title, "monthly", None, p.hour, p.minute, p.day_of_month, 1)
+        await schedule_task(ctx.application, t)
+        await update.message.reply_text(
+            f"✅ Отлично, напомню {p.day_of_month} числа в {p.hour:02d}:{p.minute:02d}: «{p.title}»."
+        )
 
-# -------------------- MAIN --------------------
-async def on_startup(app: Application):
-    # health сервер (для UptimeRobot)
-    await start_health()
-    # снимаем вебхук (чтобы polling работал на Render)
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-    # восстанавливаем расписание
-    try:
-        for t in list_active_tasks_for_all():
-            await schedule(app, t)
-    except Exception:
-        logging.exception("reschedule_all failed")
-    logging.info("Bot started.PTB=%s TZ=%s", ptb_version, TZ)
+# ------------------------ СТАРТОВЫЕ ХУКИ ------------------------
 
-# === вызывается при старте приложения ===
 async def on_startup(app: Application):
-    # на всякий случай очищаем старый webhook, чтобы polling не конфликтовал
+    # на всякий случай убираем старый вебхук, чтобы polling не конфликтовал
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         logging.warning("delete_webhook failed: %s", e)
-
-    # пересоздаём все задачи в планировщике
+    # Перепланировать все задачи
     try:
         await reschedule_all(app)
-    except Exception as e:
-        logging.exception("Reschedule failed: %s", e)
+    except Exception:
+        logging.exception("Reschedule failed")
 
-async def main():
+# ------------------------ HTTP "alive" для UptimeRobot ------------------------
+
+async def http_handle(request):
+    return web.Response(text="alive")
+
+async def run_web_app():
+    app = web.Application()
+    app.add_routes([web.get("/", http_handle)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    # держим сервер в этом потоке
+    while True:
+        await asyncio.sleep(3600)
+
+def start_web_in_thread():
+    import asyncio
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_web_app())
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+
+# ------------------------ MAIN ------------------------
+
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
 
     init_db()
+    ensure_keys_pool(1000)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    start_web_in_thread()  # поднять HTTP-сервер для пингов в отдельном потоке
+
+    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Команды
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("affairs", affairs_cmd))
     app.add_handler(CommandHandler("affairs_delete", affairs_delete_cmd))
-    app.add_handler(CommandHandler("maintenance_on", maintenance_on_cmd))
-    app.add_handler(CommandHandler("maintenance_off", maintenance_off_cmd))
+
+    # Админ-ключи
+    app.add_handler(CommandHandler("issue_key", issue_key_cmd))
     app.add_handler(CommandHandler("keys_left", keys_left_cmd))
     app.add_handler(CommandHandler("keys_free", keys_free_cmd))
     app.add_handler(CommandHandler("keys_used", keys_used_cmd))
@@ -573,37 +523,10 @@ async def main():
     # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Чистим старый webhook и пересоздаём задачи на старте
     app.post_init = on_startup
 
-    # 1) Поднимаем веб-сервер для UptimeRobot
-    web_runner = await run_web()
-
-    try:
-        # 2) Ручной жизненный цикл PTB (без run_polling!)
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-
-        # Блокируемся, пока идёт polling
-        await app.updater.wait()
-    finally:
-        # Корректное завершение
-        try:
-            await app.updater.stop()
-        except Exception:
-            pass
-        try:
-            await app.stop()
-            await app.shutdown()
-        except Exception:
-            pass
-        try:
-            await web_runner.cleanup()
-        except Exception:
-            pass
-
+    # важно: обычный run_polling (блокирующий) — без лишних циклов, чтобы не было конфликтов и ошибок event loop
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
