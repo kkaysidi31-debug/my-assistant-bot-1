@@ -495,18 +495,30 @@ def start_web_in_thread():
     th = threading.Thread(target=_run, daemon=True)
     th.start()
 
-# ------------------------ MAIN ------------------------
+# === вызывается при старте приложения ===
+async def on_startup(app: Application):
+    # снимаем вебхук, чтобы polling не конфликтовал
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logging.warning("delete_webhook failed: %s", e)
 
-def main():
+    # пересоздаём все задачи в планировщике
+    try:
+        await reschedule_all(app)
+    except Exception as e:
+        logging.exception("Reschedule failed: %s", e)
+
+
+# ================= MAIN =================
+async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
 
     init_db()
-    ensure_keys_pool(1000)
+    ensure_keys_pool(1000)   # генерим пул из 1000 ключей при старте
 
-    start_web_in_thread()  # поднять HTTP-сервер для пингов в отдельном потоке
-
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Команды
     app.add_handler(CommandHandler("start", start_cmd))
@@ -523,10 +535,16 @@ def main():
     # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    # Хук при старте
     app.post_init = on_startup
 
-    # важно: обычный run_polling (блокирующий) — без лишних циклов, чтобы не было конфликтов и ошибок event loop
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Запускаем одновременно polling и web-сервер (для UptimeRobot)
+    await asyncio.gather(
+        run_web(),
+        app.run_polling(allowed_updates=Update.ALL_TYPES),
+    )
+
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
