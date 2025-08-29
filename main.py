@@ -514,39 +514,41 @@ async def on_startup(app: Application):
     except Exception as e:
         logging.warning("set_my_commands failed: %s", e)
 
-# ====================== MAIN ======================
+# ---------------- MAIN ----------------
 
-async def main():
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
 
     init_db()
-    ensure_keys_pool(1000)
+    ensure_keys_pool(1000)      # если у тебя есть функция с ключами — оставляем
+
+    # поднимаем HTTP-эндпоинт / для UptimeRobot в отдельном потоке
+    start_web_in_thread()
 
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # команды
+    # Команды
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("affairs", affairs_cmd))
     app.add_handler(CommandHandler("affairs_delete", affairs_delete_cmd))
 
-    app.add_handler(CommandHandler("maintenance_on", maintenance_on_cmd))
-    app.add_handler(CommandHandler("maintenance_off", maintenance_off_cmd))
-
+    # Админ-ключи (если используешь)
     app.add_handler(CommandHandler("issue_key", issue_key_cmd))
     app.add_handler(CommandHandler("keys_left", keys_left_cmd))
     app.add_handler(CommandHandler("keys_free", keys_free_cmd))
     app.add_handler(CommandHandler("keys_used", keys_used_cmd))
     app.add_handler(CommandHandler("keys_reset", keys_reset_cmd))
 
-    # текст
+    # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    app.post_init = on_startup  # вызовется перед run_polling
+    # on_startup (асинхронная функция можно оставить — PTB сам вызовет)
+    app.post_init = on_startup
 
-    # запускаем одновременно polling и веб-сервер для UptimeRobot
-    await run_web()
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Запускаем polling (PTB сам управляет своим event loop)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
