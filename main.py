@@ -8,10 +8,10 @@ from typing import Optional, List, Tuple, Dict
 
 from aiohttp import web
 import telegram
-from telegram import Update
+from telegram import Update          # ← правильно
 from telegram.ext import (
-    Application, ApplicationBuilder, ContextTypes, CommandHandler,
-    MessageHandler, filters, Update as TgUpdate
+    Application, ApplicationBuilder, CommandHandler,
+    MessageHandler, ContextTypes, filters
 )
 
 # -------------------- НАСТРОЙКИ --------------------
