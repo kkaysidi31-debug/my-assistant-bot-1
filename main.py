@@ -293,14 +293,14 @@ def save_task(t: Task) -> int:
         ))
         return c.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
 
-async def schedule_task(app: Application, task_id: int) -> None:
-    t = get_task(task_id)
-    if not t or not hasattr(app, "job_queue"):
-        return
-    jq = app.job_queue
-    # удалим старые джобы с этим task_id
-   for j in app.job_queue.get_jobs_by_name(f"task-{task_id}"):
-    j.schedule_removal()
+async def schedule_task(app: Application, task_id: int):
+    # перед каждой новой задачей удаляем старые по этому же task_id
+    for j in app.job_queue.get_jobs_by_name(f"task-{task_id}"):
+        j.schedule_removal()
+
+    # тут ставим новую задачу
+    # пример: job_queue.run_once(handler, delay, name=f"task-{task_id}")
+    # сделай по своей логике, какую задачу ты там вешаешь
 
     if t.type == "once" and t.run_at_utc:
         when = t.run_at_utc
@@ -543,9 +543,10 @@ def main():
     # поднимаем HTTP-эндпоинт / для UptimeRobot в отдельном потоке
     start_web_in_thread()
 
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
-    job_queue = app.job_queue  # теперь очередь задач не будет None
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    job_queue = app.job_queue  # очередь задач
+    
     # Команды
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("affairs", affairs_cmd))
