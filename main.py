@@ -508,42 +508,42 @@ async def on_startup(app: Application):
         await reschedule_all(app)
     except Exception as e:
         logging.exception("Reschedule failed: %s", e)
-
-
+        
 # ================= MAIN =================
+
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
 
     init_db()
-    ensure_keys_pool(1000)   # генерим пул из 1000 ключей при старте
+    ensure_keys_pool(1000)   # проверяем, что ключей достаточно
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Команды
+    # --- Команды ---
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("affairs", affairs_cmd))
     app.add_handler(CommandHandler("affairs_delete", affairs_delete_cmd))
+    app.add_handler(CommandHandler("maintenance_on", maintenance_on_cmd))
+    app.add_handler(CommandHandler("maintenance_off", maintenance_off_cmd))
 
-    # Админ-ключи
+    # --- Админ-ключи ---
     app.add_handler(CommandHandler("issue_key", issue_key_cmd))
     app.add_handler(CommandHandler("keys_left", keys_left_cmd))
     app.add_handler(CommandHandler("keys_free", keys_free_cmd))
     app.add_handler(CommandHandler("keys_used", keys_used_cmd))
     app.add_handler(CommandHandler("keys_reset", keys_reset_cmd))
 
-    # Текст
+    # --- Текст ---
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Хук при старте
     app.post_init = on_startup
 
-    # Запускаем одновременно polling и web-сервер (для UptimeRobot)
+    # Запускаем одновременно polling и web-сервер
     await asyncio.gather(
         run_web(),
         app.run_polling(allowed_updates=Update.ALL_TYPES),
     )
-
 
 if __name__ == "__main__":
     import asyncio
