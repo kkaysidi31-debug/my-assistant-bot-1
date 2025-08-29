@@ -128,7 +128,9 @@ def keys_used() -> int:
 
 def issue_random_key() -> Optional[str]:"""Админ запрашивает ключ — помечаем как issued=1 и возвращаем"""
     with db() as c:
-        row = c.execute("SELECT key FROM keys WHERE issued=0 AND used_by IS NULL LIMIT 1" ).fetchone()
+        row = c.execute(
+            "SELECT key FROM keys WHERE issued=0 AND used_by IS NULL LIMIT 1" 
+        ).fetchone()
         if not row:
             return None
         k = row["key"]
