@@ -7,7 +7,8 @@ from datetime import datetime, timedelta, timezone, time as dtime
 from typing import Optional, List, Tuple, Dict
 
 from aiohttp import web
-from telegram import Update, version as ptb_version
+import telegram
+from telegram import Update
 from telegram.ext import (
     Application, ApplicationBuilder, ContextTypes, CommandHandler,
     MessageHandler, filters, Update as TgUpdate
@@ -16,14 +17,11 @@ from telegram.ext import (
 # -------------------- НАСТРОЙКИ --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s")
 
-# Токен из переменной среды (Render -> Environment)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-
-# Админ Telegram user_id (вставь свой при желании контроля ключей/режимов)
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or "0")
-
-# Часовой пояс (Калининград UTC+2; поменяй, если нужно)
 TZ = timezone(timedelta(hours=2))
+
+ptb_version = telegram.__version__
 
 # Приватные ключи (VIP001..VIP100)
 ALL_KEYS = [f"VIP{str(i).zfill(3)}" for i in range(1, 101)]
