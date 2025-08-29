@@ -547,13 +547,14 @@ async def run_web():
     await site.start()
 
 # ======================= MAIN =======================
+# ====== ХВОСТ ФАЙЛА: устойчивый запуск для Render ======
 import asyncio
 
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
 
-    # инициализация базы и ключей
+    # Инициализация БД и пула ключей (если эти функции есть в коде)
     try:
         init_db()
     except NameError:
@@ -563,14 +564,15 @@ async def main():
     except NameError:
         pass
 
+    # Приложение Telegram
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # команды
+    # Команды
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("affairs", affairs_cmd))
     app.add_handler(CommandHandler("affairs_delete", affairs_delete_cmd))
 
-    # ключи (админ)
+    # Админ-ключи (если функции объявлены)
     try:
         app.add_handler(CommandHandler("issue_key", issue_key_cmd))
         app.add_handler(CommandHandler("keys_left", keys_left_cmd))
@@ -580,15 +582,16 @@ async def main():
     except NameError:
         pass
 
+    # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # чтобы polling и веб-сервер запускались вместе
-    await asyncio.gather(
-        run_web(),
-        app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
-    )
-
+    # Запускаем вэб-эндпоинт для Render (aiohttp) и polling ПАРАЛЛЕЛЬНО
+    web_task = asyncio.create_task(run_web())
+    # ВАЖНО: не закрывать цикл внутри PTB
+    await app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+    # если polling завершился (остановка/краш) — ждём корректного завершения веб-сервера
+    await web_task
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    # один раз создаём и полностью управляем циклом тут
+    asyncio.run(main())
