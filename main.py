@@ -525,6 +525,20 @@ async def on_startup(app: Application):
         logging.exception("reschedule_all failed")
     logging.info("Bot started.PTB=%s TZ=%s", ptb_version, TZ)
 
+# === вызывается при старте приложения ===
+async def on_startup(app: Application):
+    # на всякий случай очищаем старый webhook, чтобы polling не конфликтовал
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logging.warning("delete_webhook failed: %s", e)
+
+    # пересоздаём все задачи в планировщике
+    try:
+        await reschedule_all(app)
+    except Exception as e:
+        logging.exception("Reschedule failed: %s", e)
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
