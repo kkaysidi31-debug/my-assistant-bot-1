@@ -533,30 +533,29 @@ def start_web_in_thread():
     t = threading.Thread(target=run, daemon=True)
     t.start()
 
-# --- маленький веб-сервер для Render ---
-async def _alive(_request):
+from aiohttp import web
+import asyncio
+import threading
+import os
+
+async def handle(request):
     return web.Response(text="alive")
 
 async def run_web():
     app = web.Application()
-    app.router.add_get("/", _alive)
-    port = int(os.environ.get("PORT", "10000"))
+    app.add_routes([web.get("/", handle)])
+    port = int(os.environ.get("PORT", 10000))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# ---------------- web-пинг в отдельном потоке ----------------
-import asyncio
-import threading
-
 def start_web_in_thread():
-    # run_web() — твоя aiohttp-функция, которая пишет "alive" и слушает PORT
     def _runner():
         asyncio.run(run_web())
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
-
+    
 # ======================= MAIN =======================
 def main():
     if not BOT_TOKEN:
@@ -598,8 +597,8 @@ def main():
     except NameError:
         pass
 
-    # Запускаем http-пинг отдельно, чтобы не трогать event loop Telegram
     start_web_in_thread()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
     # ВАЖНО: polling — СИНХРОННЫЙ вызов (не в asyncio.run, без await)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
