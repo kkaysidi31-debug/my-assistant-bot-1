@@ -1,5 +1,5 @@
 python-telegram-bot==21.6
 aiohttp==3.9.5
 pytz==2024.1
-requests
+requests==2.31.0
 sqlite3-binary
