@@ -546,15 +546,23 @@ async def run_web():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# ======================= MAIN =======================
-# ====== ХВОСТ ФАЙЛА: устойчивый запуск для Render ======
+# ---------------- web-пинг в отдельном потоке ----------------
 import asyncio
+import threading
 
-async def main():
+def start_web_in_thread():
+    # run_web() — твоя aiohttp-функция, которая пишет "alive" и слушает PORT
+    def _runner():
+        asyncio.run(run_web())
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+
+# ======================= MAIN =======================
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
 
-    # Инициализация БД и пула ключей (если эти функции есть в коде)
+    # Инициализация (если есть эти функции — оставляем; если нет, смело убери try/except)
     try:
         init_db()
     except NameError:
@@ -564,7 +572,6 @@ async def main():
     except NameError:
         pass
 
-    # Приложение Telegram
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Команды
@@ -572,7 +579,7 @@ async def main():
     app.add_handler(CommandHandler("affairs", affairs_cmd))
     app.add_handler(CommandHandler("affairs_delete", affairs_delete_cmd))
 
-    # Админ-ключи (если функции объявлены)
+    # Админ-ключи (если эти хэндлеры есть вверху)
     try:
         app.add_handler(CommandHandler("issue_key", issue_key_cmd))
         app.add_handler(CommandHandler("keys_left", keys_left_cmd))
@@ -585,13 +592,17 @@ async def main():
     # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Запускаем вэб-эндпоинт для Render (aiohttp) и polling ПАРАЛЛЕЛЬНО
-    web_task = asyncio.create_task(run_web())
-    # ВАЖНО: не закрывать цикл внутри PTB
-    await app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
-    # если polling завершился (остановка/краш) — ждём корректного завершения веб-сервера
-    await web_task
+    # on_startup (если есть)
+    try:
+        app.post_init = on_startup
+    except NameError:
+        pass
+
+    # Запускаем http-пинг отдельно, чтобы не трогать event loop Telegram
+    start_web_in_thread()
+
+    # ВАЖНО: polling — СИНХРОННЫЙ вызов (не в asyncio.run, без await)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    # один раз создаём и полностью управляем циклом тут
-    asyncio.run(main())
+    main()
