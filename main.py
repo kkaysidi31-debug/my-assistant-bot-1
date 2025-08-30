@@ -19,6 +19,16 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
+import requests
+
+def reset_webhook(bot_token: str):
+    url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
+    try:
+        resp = requests.get(url, timeout=10)
+        print("Webhook reset:", resp.json())
+    except Exception as e:
+        print("Failed to reset webhook:", e)
+        
 # ====================== НАСТРОЙКИ ======================
 
 logging.basicConfig(
@@ -556,52 +566,56 @@ def start_web_in_thread():
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
     
-# ======================= MAIN =======================
+# ===================== MAIN =====================
+
+import requests
+
+def reset_webhook(bot_token: str):
+    """Удаляет вебхук при старте, чтобы не было конфликта с getUpdates"""
+    url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
+    try:
+        resp = requests.get(url, timeout=10)
+        print("Webhook reset:", resp.json())
+    except Exception as e:
+        print("Failed to reset webhook:", e)
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render -> Environment.")
 
-    # Инициализация (если есть эти функции — оставляем; если нет, смело убери try/except)
-    try:
-        init_db()
-    except NameError:
-        pass
-    try:
-        ensure_keys_pool(1000)
-    except NameError:
-        pass
+    # Автосброс webhook при запуске
+    reset_webhook(BOT_TOKEN)
+
+    init_db()
+    ensure_keys_pool(1000)
+
+    start_web_in_thread()  # HTTP-пинг для Render
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Команды
+    # Команды для обычных пользователей
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("affairs", affairs_cmd))
     app.add_handler(CommandHandler("affairs_delete", affairs_delete_cmd))
 
-    # Админ-ключи (если эти хэндлеры есть вверху)
-    try:
-        app.add_handler(CommandHandler("issue_key", issue_key_cmd))
-        app.add_handler(CommandHandler("keys_left", keys_left_cmd))
-        app.add_handler(CommandHandler("keys_free", keys_free_cmd))
-        app.add_handler(CommandHandler("keys_used", keys_used_cmd))
-        app.add_handler(CommandHandler("keys_reset", keys_reset_cmd))
-    except NameError:
-        pass
+    # Команды для админа (ключи)
+    app.add_handler(CommandHandler("issue_key", issue_key_cmd))
+    app.add_handler(CommandHandler("keys_left", keys_left_cmd))
+    app.add_handler(CommandHandler("keys_free", keys_free_cmd))
+    app.add_handler(CommandHandler("keys_used", keys_used_cmd))
+    app.add_handler(CommandHandler("keys_reset", keys_reset_cmd))
 
-    # Текст
+    # Техработы (только админ)
+    app.add_handler(CommandHandler("maintenance_on", maintenance_on_cmd))
+    app.add_handler(CommandHandler("maintenance_off", maintenance_off_cmd))
+
+    # Обработка текста
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # on_startup (если есть)
-    try:
-        app.post_init = on_startup
-    except NameError:
-        pass
+    print("Bot started. Polling...")
+    app.run_polling()
 
-    start_web_in_thread()
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-    # ВАЖНО: polling — СИНХРОННЫЙ вызов (не в asyncio.run, без await)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
