@@ -125,7 +125,7 @@ def parse_natural_ru(msg: str) -> Optional[Dict[str, Any]]:
         unit = m.group(2)
         text = m.group(3).strip()
 
-    if unit in ("секунд", "сек"):
+        if unit in ("секунд", "сек"):
             delta = timedelta(seconds=n)
         elif unit in ("минут", "мин"):
             delta = timedelta(minutes=n)
