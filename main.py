@@ -145,7 +145,7 @@ def parse_natural_ru(msg: str) -> Optional[Dict[str, Any]]:
         run_at = datetime(now.year, now.month, now.day, hh, mm, tzinfo=TZ)
         if run_at <= now:
             run_at += timedelta(days=1)
-        run_at_utc = int(run_at.astimezone(ZoneInfo("UTC")).timestamp()))
+        run_at_utc = int(run_at.astimezone(ZoneInfo("UTC")).timestamp())
         return {"type": "once", "text": text, "run_at_utc": run_at_utc}
 
     # «завтра в HH:MM ТЕКСТ»
