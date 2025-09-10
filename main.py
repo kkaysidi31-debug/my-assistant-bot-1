@@ -14,18 +14,18 @@ from telegram.ext import (
     CommandHandler, MessageHandler, ContextTypes, filters,
 )
 
-# ---------- ЛОГИ ----------
+# ===== ЛОГИ =====
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
-# ---------- КОНФИГ ----------
+# ===== КОНФИГ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TZ = ZoneInfo("Europe/Kaliningrad")
 
 WELCOME = (
     "👋 Привет, я твой бот-Ассистент.\n\n"
-    "Помогу оптимизировать рутину, чтобы ничего не забывал.\n\n"
-    "📌 Примеры:\n"
+    "Помогу оптимизировать рутину, чтобы ты ничего не забывал.\n\n"
+    "📌 Примеры, как задавать напоминания:\n"
     "• «через 5 минут поесть»\n"
     "• «сегодня в 18:30 тренировка»\n"
     "• «завтра в 09:00 позвонить маме»\n"
@@ -34,7 +34,7 @@ WELCOME = (
     "• «30.08 в 15:30 созвон»\n"
 )
 
-# ---------- БАЗА ДАННЫХ ----------
+# ===== БД =====
 DB_PATH = os.path.join(os.getcwd(), "bot.db")
 
 @contextmanager
@@ -53,44 +53,38 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS tasks (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id     INTEGER NOT NULL,
-            type        TEXT    NOT NULL,            -- 'once' | 'daily'
+            type        TEXT    NOT NULL,           -- 'once' | 'daily'
             text        TEXT    NOT NULL,
-            run_at_utc  INTEGER,                     -- для 'once': unix-utc
-            daily_hhmm  INTEGER,                     -- для 'daily': HH*100+MM
+            run_at_utc  INTEGER,                    -- для 'once'
+            daily_hhmm  INTEGER,                    -- для 'daily': HH*100+MM
             active      INTEGER NOT NULL DEFAULT 1
         )
         """)
     log.info("DB ready")
 
-# ---------- ПЛАНИРОВЩИК ----------
+# ===== Планировщик (JobQueue) =====
 async def job_fire(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправляет напоминание; одноразовые — деактивирует."""
-    data = ctx.job.data or {}
-    chat_id = data.get("chat_id")
-    text = data.get("text", "")
-    task_id = data.get("task_id")
-    ttype = data.get("type")
+    """Отправляет текст и, если задача одноразовая — деактивирует её в БД и снимает из очереди."""
+    chat_id = ctx.job.data["chat_id"]
+    text = ctx.job.data["text"]
+    task_id = ctx.job.data.get("task_id")
+    await ctx.bot.send_message(chat_id=chat_id, text=text)
 
-    if chat_id:
-        await ctx.bot.send_message(chat_id=chat_id, text=text)
-
-    if ttype == "once" and task_id:
+    if task_id:
+        # помечаем неактивной и снимаем из JobQueue
         with db() as con:
             con.execute("UPDATE tasks SET active=0 WHERE id=?", (task_id,))
-        ctx.job.schedule_removal()
+        for j in ctx.application.job_queue.get_jobs_by_name(f"task:{task_id}"):
+            j.schedule_removal()
 
 def schedule_task(app: Application, row: sqlite3.Row) -> None:
+    """Добавляет запись из БД в JobQueue."""
     if not row["active"]:
         return
 
     jq = app.job_queue
     name = f"task:{row['id']}"
-    data = {
-        "chat_id": row["chat_id"],
-        "text": row["text"],
-        "task_id": row["id"],
-        "type": row["type"],
-    }
+    data = {"chat_id": row["chat_id"], "text": row["text"], "task_id": row["id"]}
 
     if row["type"] == "once":
         when = datetime.fromtimestamp(int(row["run_at_utc"]), tz=ZoneInfo("UTC"))
@@ -102,12 +96,13 @@ def schedule_task(app: Application, row: sqlite3.Row) -> None:
         jq.run_daily(job_fire, time=t, data=data, name=name)
 
 async def reschedule_all(app: Application) -> None:
+    """После перезапуска поднимаем все активные задачи."""
     with db() as con:
         rows = con.execute("SELECT * FROM tasks WHERE active=1").fetchall()
     for r in rows:
         schedule_task(app, r)
 
-# ---------- ПАРСЕР ЕНЯ ----------
+# ===== Парсер естественного языка =====
 RU_MONTHS = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
     "мая": 5, "июня": 6, "июля": 7, "августа": 8,
@@ -119,20 +114,18 @@ def parse_natural_ru(msg: str) -> Optional[Dict[str, Any]]:
     Возвращает:
       {'type': 'once',  'text': str, 'run_at_utc': int}
       {'type': 'daily', 'text': str, 'hhmm': int}
-      или None.
+    Или None.
     """
     s = re.sub(r"\s+", " ", msg.strip().lower())
 
-    # ---------- «через N сек/мин/час ТЕКСТ»
+    # «через N сек/мин/час ТЕКСТ»
     m = re.match(r"^через\s+(\d+)\s*(секунд|сек|минут|мин|часов|час)\s+(.+)$", s)
     if m:
         n = int(m.group(1))
         unit = m.group(2)
         text = m.group(3).strip()
 
-        # ВАЖНО: никаких лишних символов и правильные отступы
-        delta = None
-        if unit in ("секунд", "сек"):
+    if unit in ("секунд", "сек"):
             delta = timedelta(seconds=n)
         elif unit in ("минут", "мин"):
             delta = timedelta(minutes=n)
@@ -143,7 +136,7 @@ def parse_natural_ru(msg: str) -> Optional[Dict[str, Any]]:
         run_at_utc = int(run_at.astimezone(ZoneInfo("UTC")).timestamp())
         return {"type": "once", "text": text, "run_at_utc": run_at_utc}
 
-    # ---------- «сегодня в HH:MM ТЕКСТ»
+    # «сегодня в HH:MM ТЕКСТ»
     m = re.match(r"^сегодня\s+в\s+(\d{1,2}):(\d{2})\s+(.+)$", s)
     if m:
         hh, mm = int(m.group(1)), int(m.group(2))
@@ -152,10 +145,10 @@ def parse_natural_ru(msg: str) -> Optional[Dict[str, Any]]:
         run_at = datetime(now.year, now.month, now.day, hh, mm, tzinfo=TZ)
         if run_at <= now:
             run_at += timedelta(days=1)
-        run_at_utc = int(run_at.astimezone(ZoneInfo("UTC")).timestamp())
+        run_at_utc = int(run_at.astimezone(ZoneInfo("UTC")).timestamp()))
         return {"type": "once", "text": text, "run_at_utc": run_at_utc}
 
-    # ---------- «завтра в HH:MM ТЕКСТ»
+    # «завтра в HH:MM ТЕКСТ»
     m = re.match(r"^завтра\s+в\s+(\d{1,2}):(\d{2})\s+(.+)$", s)
     if m:
         hh, mm = int(m.group(1)), int(m.group(2))
@@ -165,19 +158,14 @@ def parse_natural_ru(msg: str) -> Optional[Dict[str, Any]]:
         run_at_utc = int(run_at.astimezone(ZoneInfo("UTC")).timestamp())
         return {"type": "once", "text": text, "run_at_utc": run_at_utc}
 
-    # ---------- «каждый день в HH:MM ТЕКСТ»
+    # «каждый день в HH:MM ТЕКСТ»
     m = re.match(r"^каждый\s+день\s+в\s+(\d{1,2}):(\d{2})\s+(.+)$", s)
     if m:
         hh, mm = int(m.group(1)), int(m.group(2))
         text = m.group(3).strip()
         return {"type": "daily", "text": text, "hhmm": hh * 100 + mm}
 
-    # ---------- «30 августа ТЕКСТ»
-    RU_MONTHS = {
-        "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
-        "мая": 5, "июня": 6, "июля": 7, "августа": 8,
-        "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
-    }
+    # «30 августа ТЕКСТ»
     m = re.match(r"^(\d{1,2})\s+([а-яё]+)\s+(.+)$", s)
     if m and m.group(2) in RU_MONTHS:
         day = int(m.group(1))
@@ -191,7 +179,7 @@ def parse_natural_ru(msg: str) -> Optional[Dict[str, Any]]:
         run_at_utc = int(run_at.astimezone(ZoneInfo("UTC")).timestamp())
         return {"type": "once", "text": text, "run_at_utc": run_at_utc}
 
-    # ---------- «30.08 в HH:MM ТЕКСТ»
+    # «30.08 в HH:MM ТЕКСТ»
     m = re.match(r"^(\d{1,2})\.(\d{1,2})\s+в\s+(\d{1,2}):(\d{2})\s+(.+)$", s)
     if m:
         day, month = int(m.group(1)), int(m.group(2))
@@ -207,10 +195,7 @@ def parse_natural_ru(msg: str) -> Optional[Dict[str, Any]]:
 
     return None
 
-
-
-
-# ---------- ХЕЛПЕР ДЛЯ ВЫВОДА ----------
+# ===== Утилиты для вывода =====
 def human_when(row: sqlite3.Row) -> str:
     if row["type"] == "once":
         dt = datetime.fromtimestamp(int(row["run_at_utc"]), tz=ZoneInfo("UTC")).astimezone(TZ)
@@ -219,33 +204,32 @@ def human_when(row: sqlite3.Row) -> str:
     hh, mm = divmod(hhmm, 100)
     return f"каждый день в {hh:02d}:{mm:02d}"
 
-
-# ---------- ХЕНДЛЕРЫ ----------
+# ===== Хэндлеры =====
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(WELCOME)
 
-
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(WELCOME)
-
 
 async def tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     with db() as con:
         rows = con.execute(
             "SELECT id, type, text, run_at_utc, daily_hhmm, active "
-            "FROM tasks WHERE chat_id=? AND active=1 "
-            "ORDER BY id DESC LIMIT 50",
+            "FROM tasks WHERE chat_id=? ORDER BY id DESC LIMIT 50",
             (chat_id,)
         ).fetchall()
 
     if not rows:
-        await update.message.reply_text("Пока активных напоминаний нет.")
+        await update.message.reply_text("Пока напоминаний нет.")
         return
 
-    lines = [f"✅ ID:{r['id']} — {human_when(r)} — «{r['text']}»" for r in rows]
+    lines = []
+    for r in rows:
+        status = "✅" if r["active"] else "❌"
+        when = human_when(r)
+        lines.append(f"{status} ID:{r['id']} — {when} — «{r['text']}»")
     await update.message.reply_text("\n".join(lines))
-
 
 async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args:
@@ -259,7 +243,7 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     chat_id = update.effective_chat.id
     with db() as con:
-        row = con.execute("SELECT chat_id, active FROM tasks WHERE id=?", (tid,)).fetchone()
+        row = con.execute("SELECT chat_id, active, type FROM tasks WHERE id=?", (tid,)).fetchone()
         if not row:
             await update.message.reply_text("Такого ID не нашёл.")
             return
@@ -269,21 +253,23 @@ async def cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not row["active"]:
             await update.message.reply_text("Она уже отменена.")
             return
+
         con.execute("UPDATE tasks SET active=0 WHERE id=?", (tid,))
 
-    # снять из планировщика
     for j in ctx.application.job_queue.get_jobs_by_name(f"task:{tid}"):
         j.schedule_removal()
 
     await update.message.reply_text("🛑 Напоминание отменено.")
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    parsed = parse_natural_ru(update.message.text or "")
+    msg = update.message.text or ""
+    parsed = parse_natural_ru(msg)
     if not parsed:
         await update.message.reply_text("Не понял. Примеры см. в /help")
         return
 
     chat_id = update.effective_chat.id
+
     if parsed["type"] == "once":
         with db() as con:
             con.execute(
@@ -292,6 +278,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
             task_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
             row = con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+
         schedule_task(ctx.application, row)
 
         when_local = datetime.fromtimestamp(parsed["run_at_utc"], tz=ZoneInfo("UTC")).astimezone(TZ)
@@ -307,13 +294,14 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
             task_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
             row = con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+
         schedule_task(ctx.application, row)
         hh, mm = divmod(hhmm, 100)
         await update.message.reply_text(
-            f"✅ Отлично! Ежедневное напоминание: «{parsed['text']}», {hh:02d}:{mm:02d}.\nID: {task_id}"
+            f"✅ Отлично! Ежедневное напоминание создано: «{parsed['text']}», в {hh:02d}:{mm:02d}.\nID: {task_id}"
         )
 
-# ---------- СТАРТ / INIT ----------
+# ===== Инициализация =====
 async def on_startup(app: Application) -> None:
     await reschedule_all(app)
     try:
@@ -341,11 +329,10 @@ def build_app() -> Application:
     return app
 
 def main() -> None:
-    print(">>> ENTER main()")  # маркер, что guard сработал
     init_db()
     app = build_app()
     print("✅ Bot started. Polling…")
-    app.run_polling()  # блокирующий вызов
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
