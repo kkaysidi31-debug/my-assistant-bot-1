@@ -6,9 +6,14 @@ import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta, time as dtime
 from typing import Optional, Dict, Any
+# --- импортов достаточно этих двух строк ---
 import telegram as tg
-log.info(f"PTB version: {getattr(tg, '__version__', 'unknown')}")
+import logging
 
+# --- сразу инициализируем логгер, а потом пишем в лог ---
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bot")
+log.info(f"PTB version: {getattr(tg, '__version__', 'unknown')}")
 from zoneinfo import ZoneInfo
 from telegram import Update, BotCommand
 from telegram.ext import (
